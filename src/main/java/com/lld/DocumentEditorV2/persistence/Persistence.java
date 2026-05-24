@@ -1,0 +1,7 @@
+package com.lld.DocumentEditorV2.persistence;
+
+import com.lld.DocumentEditorV2.models.Document;
+
+public interface Persistence {
+    void save(Document document);
+}
