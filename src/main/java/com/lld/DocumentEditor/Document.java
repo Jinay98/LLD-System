@@ -1,12 +1,13 @@
 package com.lld.DocumentEditor;
 
+import java.util.ArrayList;
 import java.util.List;
 
 public class Document {
     List<DocumentElement> elements;
 
     public Document() {
-
+        elements = new ArrayList<>();
     }
 
     public Document(List<DocumentElement> elements) {
