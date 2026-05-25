@@ -1,11 +1,11 @@
-package com.lld.RobotStrategyPattern;
+package com.lld.patterns.StrategyPattern;
 
-import com.lld.RobotStrategyPattern.FlyingStrategy.FlyingStrategy;
-import com.lld.RobotStrategyPattern.FlyingStrategy.impl.NonFlyingStrategy;
-import com.lld.RobotStrategyPattern.FlyingStrategy.impl.NormalFlyingStrategy;
-import com.lld.RobotStrategyPattern.TalkingStrategy.TalkingStrategy;
-import com.lld.RobotStrategyPattern.TalkingStrategy.impl.NonTalkingStrategy;
-import com.lld.RobotStrategyPattern.TalkingStrategy.impl.NormalTakingStrategy;
+import com.lld.patterns.StrategyPattern.FlyingStrategy.FlyingStrategy;
+import com.lld.patterns.StrategyPattern.FlyingStrategy.impl.NonFlyingStrategy;
+import com.lld.patterns.StrategyPattern.FlyingStrategy.impl.NormalFlyingStrategy;
+import com.lld.patterns.StrategyPattern.TalkingStrategy.TalkingStrategy;
+import com.lld.patterns.StrategyPattern.TalkingStrategy.impl.NonTalkingStrategy;
+import com.lld.patterns.StrategyPattern.TalkingStrategy.impl.NormalTakingStrategy;
 
 public class Client {
     public static void main(String[] args) {

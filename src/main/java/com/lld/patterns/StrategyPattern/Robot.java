@@ -1,7 +1,7 @@
-package com.lld.RobotStrategyPattern;
+package com.lld.patterns.StrategyPattern;
 
-import com.lld.RobotStrategyPattern.FlyingStrategy.FlyingStrategy;
-import com.lld.RobotStrategyPattern.TalkingStrategy.TalkingStrategy;
+import com.lld.patterns.StrategyPattern.FlyingStrategy.FlyingStrategy;
+import com.lld.patterns.StrategyPattern.TalkingStrategy.TalkingStrategy;
 
 public class Robot {
     TalkingStrategy talkingStrategy;

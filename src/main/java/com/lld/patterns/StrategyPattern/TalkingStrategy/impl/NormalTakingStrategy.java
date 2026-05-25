@@ -1,6 +1,6 @@
-package com.lld.RobotStrategyPattern.TalkingStrategy.impl;
+package com.lld.patterns.StrategyPattern.TalkingStrategy.impl;
 
-import com.lld.RobotStrategyPattern.TalkingStrategy.TalkingStrategy;
+import com.lld.patterns.StrategyPattern.TalkingStrategy.TalkingStrategy;
 
 public class NormalTakingStrategy implements TalkingStrategy {
     @Override
