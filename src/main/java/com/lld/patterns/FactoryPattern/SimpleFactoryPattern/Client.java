@@ -1,4 +1,4 @@
-package com.lld.patterns.FactoryPattern;
+package com.lld.patterns.FactoryPattern.SimpleFactoryPattern;
 
 public class Client {
     public static void main(String[] args){

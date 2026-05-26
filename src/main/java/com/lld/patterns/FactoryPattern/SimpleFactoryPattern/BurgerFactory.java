@@ -1,7 +1,7 @@
-package com.lld.patterns.FactoryPattern;
+package com.lld.patterns.FactoryPattern.SimpleFactoryPattern;
 
-import static com.lld.patterns.FactoryPattern.enums.BurgerTypes.LARGE;
-import static com.lld.patterns.FactoryPattern.enums.BurgerTypes.SMALL;
+import static com.lld.patterns.FactoryPattern.SimpleFactoryPattern.enums.BurgerTypes.LARGE;
+import static com.lld.patterns.FactoryPattern.SimpleFactoryPattern.enums.BurgerTypes.SMALL;
 
 public class BurgerFactory {
 
