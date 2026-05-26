@@ -8,7 +8,7 @@ public class Singleton3 {
         System.out.println("Private Singleton constructor has been called");
     }
 
-    public static Singleton3 getInstance() {
+    public static Singleton3 getInstance(){
         return instance;
     }
 }

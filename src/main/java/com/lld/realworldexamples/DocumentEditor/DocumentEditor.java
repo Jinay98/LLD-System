@@ -1,4 +1,4 @@
-package com.lld.DocumentEditor;
+package com.lld.realworldexamples.DocumentEditor;
 
 public class DocumentEditor {
     public Document doc;
