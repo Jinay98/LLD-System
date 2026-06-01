@@ -25,5 +25,12 @@ public class Client {
         if (temp1 == temp2) {
             System.out.println("Both the instances point to the same object");
         }
+
+        Singleton4 object1 = Singleton4.getInstance();
+        Singleton4 object2 = Singleton4.getInstance();
+
+        if (object1 == object2) {
+            System.out.println("Both the instances point to the same object");
+        }
     }
 }
