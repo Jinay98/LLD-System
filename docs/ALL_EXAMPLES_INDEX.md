@@ -1,119 +1,85 @@
-# Complete LLD Examples & Patterns Library
+# LLD Interview Preparation — Complete Library Index
 
-Your comprehensive Low-Level Design study resource with 6 fully documented examples.
-
----
-
-## 📚 All Examples
-
-### Real-World Systems
-
-#### 1. **Zomato** - Food Ordering System ⭐
-**Type:** Complete Real-World LLD  
-**Complexity:** Advanced  
-**Patterns:** Singleton, Manager, Factory, Strategy, Orchestrator, Composition  
-**Location:** `realworldexamples/zomato/docs/`
-
-**What You'll Learn:**
-- System design from user flow
-- Manager pattern for each model
-- Orchestrator pattern for workflows
-- Strategy pattern for payments & notifications
-- Factory pattern for complex object creation
+Comprehensive Low-Level Design study resources covering real-world system design, API modelling, DB schema, design patterns, concurrency analysis, and code review findings.
 
 ---
 
-#### 2. **DocumentEditor** - Simple Composite Pattern
-**Type:** Pattern Example  
-**Complexity:** Beginner  
-**Pattern:** Composite (Simple)  
-**Location:** `realworldexamples/DocumentEditor/docs/`
+## Interview Reference Documents (new detailed docs)
 
-**What You'll Learn:**
-- Composite pattern basics
-- Common interface for different types
-- Polymorphism
+Each doc covers: entities, design patterns, full DB schema, API endpoints with failure cases, concurrency notes, and code review findings.
 
----
-
-#### 3. **DocumentEditorV2** - Hierarchical Composite Pattern
-**Type:** Pattern Example  
-**Complexity:** Intermediate  
-**Pattern:** Composite (Advanced with Tree Structure)  
-**Location:** `realworldexamples/DocumentEditorV2/docs/`
-
-**What You'll Learn:**
-- True composite pattern with nesting
-- Recursive operations
-- Aggregate operations
+| System | Patterns | Complexity | Doc |
+|--------|----------|-----------|-----|
+| ATM System | Singleton, State, Chain of Responsibility | ⭐⭐⭐ | [atm_system.md](atm_system.md) |
+| Movie Booking System | Singleton, Strategy (pricing + payment), Template Method | ⭐⭐⭐⭐ | [movie_booking_system.md](movie_booking_system.md) |
+| Splitwise | Singleton, Strategy (split types), Observer | ⭐⭐⭐⭐ | [splitwise.md](splitwise.md) |
+| Online Stock Exchange | Singleton, Builder, State, Observer, Strategy, Façade | ⭐⭐⭐⭐⭐ | [online_stock_exchange.md](online_stock_exchange.md) |
+| URL Shortener | Singleton, Strategy (key gen), Observer, Repository, Builder | ⭐⭐⭐ | [url_shortener.md](url_shortener.md) |
+| Zomato Food Ordering | Singleton, Factory, Strategy (payment + notification) | ⭐⭐⭐⭐ | [zomato_food_ordering.md](zomato_food_ordering.md) |
+| Elevator System | Singleton, Strategy (dispatch), Observer, SCAN algorithm | ⭐⭐⭐⭐ | [elevator_system.md](elevator_system.md) |
+| Pub-Sub System | Singleton, Observer, Thread Pool | ⭐⭐⭐ | [pub_sub_system.md](pub_sub_system.md) |
+| Rate Limiter | Strategy (5 algorithms) | ⭐⭐⭐ | [rate_limiter.md](rate_limiter.md) |
+| LRU Cache | Composite Data Structure | ⭐⭐ | [lru_cache.md](lru_cache.md) |
+| Vending Machine | Singleton, State | ⭐⭐ | [vending_machine.md](vending_machine.md) |
+| Tic-Tac-Toe | Singleton, Strategy (winning), Observer | ⭐⭐ | [tic_tac_toe.md](tic_tac_toe.md) |
+| Snakes and Ladders | Builder, Template Method, Inheritance | ⭐ | [snakes_and_ladders.md](snakes_and_ladders.md) |
+| Amazon Locker System | Singleton, Strategy (assignment + notification) | ⭐⭐⭐ | [amazon_locker_system.md](amazon_locker_system.md) |
+| Shopping Cart | Singleton, Strategy (3 discount types), Observer | ⭐⭐⭐ | [shopping_cart.md](shopping_cart.md) |
 
 ---
 
-#### 4. **FactoryPattern** - Object Creation
-**Type:** Pattern Study  
-**Complexity:** Beginner-Intermediate  
-**Location:** `patterns/FactoryPattern/docs/`
+## Guide for Creating New Docs
+
+When a new real-world example is added, follow the template in:
+
+**[guide_for_new_docs.md](guide_for_new_docs.md)**
+
+It contains: section structure, DB schema pitfalls, API design pitfalls, a pattern cheat-sheet, and a pre-publish checklist.
 
 ---
 
-#### 5. **SingletonPattern** - Single Instance Control
-**Type:** Pattern Study  
-**Complexity:** Beginner  
-**Location:** `patterns/SingletonPattern/docs/`
+## Design Patterns Quick Reference
+
+| Pattern | Used In |
+|---------|---------|
+| Singleton | ATM, Movie Booking, Splitwise, Stock Exchange, URL Shortener, Zomato, Elevator, PubSub, Vending, TicTacToe, Amazon Locker, Shopping Cart |
+| Strategy | Movie Booking, Splitwise, Stock Exchange, URL Shortener, Zomato, Elevator, Rate Limiter, TicTacToe, Amazon Locker (2), Shopping Cart (3 discount types) |
+| State | ATM, Vending Machine, Stock Exchange (Order lifecycle) |
+| Observer | Splitwise, Stock Exchange, URL Shortener, Elevator, Pub-Sub, TicTacToe, Shopping Cart |
+| Builder | Stock Exchange (OrderBuilder), Snakes and Ladders (Game), URL Shortener (ShortenedURL) |
+| Factory | Zomato (Payment, Notification, Order factories) |
+| Chain of Responsibility | ATM (cash denomination dispensing) |
+| Repository | URL Shortener (URLRepository) |
+| Façade | Stock Exchange (StockBrokerageSystem) |
 
 ---
 
-#### 6. **StrategyPattern** - Algorithm Selection
-**Type:** Pattern Study  
-**Complexity:** Beginner-Intermediate  
-**Location:** `patterns/StrategyPattern/docs/`
+## Recommended Learning Path
+
+### Quick review (30 min)
+1. LRU Cache — pure data structure
+2. Vending Machine — State pattern
+3. Snakes and Ladders — Builder + game loop
+
+### Intermediate (2 hours)
+1. ATM System — State + CoR + threading
+2. Pub-Sub — Observer + async threading
+3. URL Shortener — Repository + Strategy
+4. Rate Limiter — 5 algorithms compared
+
+### Advanced (3+ hours)
+1. Elevator System — multithreading + SCAN
+2. Splitwise — balance ledger + concurrency
+3. Movie Booking — seat locking + payment flow
+4. Online Stock Exchange — order matching engine
+5. Zomato — full e-commerce flow
 
 ---
 
-## 🎯 Recommended Learning Path
+## Key Interview Topics Covered
 
-### For Complete Beginners (~2.5 hours)
-1. SingletonPattern (15 min)
-2. DocumentEditor (15 min)
-3. StrategyPattern (20 min)
-4. FactoryPattern (20 min)
-5. DocumentEditorV2 (15 min)
-6. Zomato (60 min)
-
-### For Intermediate Engineers (~2 hours)
-1. Zomato (60 min)
-2. StrategyPattern (15 min)
-3. FactoryPattern (15 min)
-4. SingletonPattern (15 min)
-5. DocumentEditor (10 min)
-6. DocumentEditorV2 (15 min)
-
----
-
-## 📋 Quick Reference
-
-| Example | Pattern(s) | Difficulty | Time |
-|---------|-----------|-----------|------|
-| Zomato | Multiple | ⭐⭐⭐⭐ | 60min |
-| DocumentEditor | Composite | ⭐ | 15min |
-| DocumentEditorV2 | Composite Adv | ⭐⭐ | 15min |
-| FactoryPattern | Factory | ⭐⭐ | 20min |
-| SingletonPattern | Singleton | ⭐ | 15min |
-| StrategyPattern | Strategy | ⭐⭐ | 20min |
-
----
-
-## 🚀 Start Here
-
-Pick your entry point and dive in:
-
-**If you're starting from zero:** `SingletonPattern/docs/README.md`
-
-**If you want to see everything:** `zomato/docs/README.md`
-
-**If you want one pattern:** Pick from `patterns/*/docs/README.md`
-
----
-
-**Your complete interview preparation library is ready! 🎓**
-
+- **Concurrency:** Every doc has a dedicated "Concurrency & Thread-Safety Notes" section
+- **DB Schema:** Complete SQL `CREATE TABLE` blocks with indexes, constraints, and comments in every doc
+- **API Design:** Every endpoint includes happy path, failure cases, and HTTP status codes
+- **Failure Handling:** TOCTOU races, payment failures, lock expiry, idempotency — all documented
+- **Code Review:** Each doc has findings categorized as Critical / Design / Minor
