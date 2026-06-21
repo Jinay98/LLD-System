@@ -23,6 +23,8 @@ Each doc covers: entities, design patterns, full DB schema, API endpoints with f
 | Vending Machine | Singleton, State | ⭐⭐ | [vending_machine.md](vending_machine.md) |
 | Tic-Tac-Toe | Singleton, Strategy (winning), Observer | ⭐⭐ | [tic_tac_toe.md](tic_tac_toe.md) |
 | Snakes and Ladders | Builder, Template Method, Inheritance | ⭐ | [snakes_and_ladders.md](snakes_and_ladders.md) |
+| Amazon Locker System | Singleton, Strategy (assignment + notification) | ⭐⭐⭐ | [amazon_locker_system.md](amazon_locker_system.md) |
+| Shopping Cart | Singleton, Strategy (3 discount types), Observer | ⭐⭐⭐ | [shopping_cart.md](shopping_cart.md) |
 
 ---
 
@@ -40,10 +42,10 @@ It contains: section structure, DB schema pitfalls, API design pitfalls, a patte
 
 | Pattern | Used In |
 |---------|---------|
-| Singleton | ATM, Movie Booking, Splitwise, Stock Exchange, URL Shortener, Zomato, Elevator, PubSub, Vending, TicTacToe |
-| Strategy | Movie Booking, Splitwise, Stock Exchange, URL Shortener, Zomato, Elevator, Rate Limiter, TicTacToe |
+| Singleton | ATM, Movie Booking, Splitwise, Stock Exchange, URL Shortener, Zomato, Elevator, PubSub, Vending, TicTacToe, Amazon Locker, Shopping Cart |
+| Strategy | Movie Booking, Splitwise, Stock Exchange, URL Shortener, Zomato, Elevator, Rate Limiter, TicTacToe, Amazon Locker (2), Shopping Cart (3 discount types) |
 | State | ATM, Vending Machine, Stock Exchange (Order lifecycle) |
-| Observer | Splitwise, Stock Exchange, URL Shortener, Elevator, Pub-Sub, TicTacToe |
+| Observer | Splitwise, Stock Exchange, URL Shortener, Elevator, Pub-Sub, TicTacToe, Shopping Cart |
 | Builder | Stock Exchange (OrderBuilder), Snakes and Ladders (Game), URL Shortener (ShortenedURL) |
 | Factory | Zomato (Payment, Notification, Order factories) |
 | Chain of Responsibility | ATM (cash denomination dispensing) |
