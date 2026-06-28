@@ -89,11 +89,13 @@ Response 200 OK:
 10. `Executive Portal` —[HTTPS POST /v1/margin/alerts/98765/action]→ `Alerting Service`: Risk officer signs off or starts liquidation.
 11. `Alerting Service` —[SQL SELECT FOR UPDATE]→ `PostgreSQL DB`: Locks margin account and transitions state to `LIQUIDATING`.
 
-#### C. Infrastructure Topology
-*   **Load Balancer:** Network Load Balancer (NLB) routing TCP connections to WebSocket handlers, and ALB for HTTP routing.
-*   **Rate Limiter:** Token Bucket algorithm implemented in Redis. Configured at 60 requests per minute per executive to secure critical actions.
-*   **Blob Storage:** AWS S3 for storage of daily margin audit snapshots and liquidation compliance audit reports.
-*   **Cache Layers:** Redis Cluster caching stock price quotes (1-sec TTL, volatile-lru eviction) and tracking active alert notifications (10-min TTL).
+#### C. Tech Stack Summary
+```
+DB: PostgreSQL  [Why: ACID for margin call lifecycle; optimistic/pessimistic locking for concurrent valuation and executive actions]
+Cache: Redis    [Why: real-time stock price quotes (1-sec TTL) for MTM calculations; active alert deduplication keys]
+Queue: Kafka    [Why: decouple notification delivery (SMS, email, dashboard) from alert creation — observable by multiple consumers]
+Read/Write: Read-heavy on price cache (every account evaluation reads N tickers from Redis). Writes are periodic (risk sweep cron) but critical (ACID state transitions).
+```
 
 ---
 
@@ -209,7 +211,33 @@ BEGIN;
 COMMIT;
 ```
 
-#### D. NoSQL Decision
+#### D. Key Business Queries
+
+```sql
+-- 1. Breached accounts needing alerts (cron sweep query)
+SELECT id, user_id, outstanding_debt_in_paise, cash_collateral_in_paise, margin_status
+FROM margin_accounts
+WHERE margin_status IN ('BREACHED', 'WARNING')
+ORDER BY id ASC;
+-- Index used: idx_margin_accounts_status
+
+-- 2. Open margin calls for risk desk (cursor-paginated)
+SELECT id, user_id, equity_at_breach_in_paise, margin_deficit_in_paise, status, deadline, created_at
+FROM margin_calls
+WHERE status IN ('PENDING', 'NOTIFIED')
+  AND id < :cursor_id
+ORDER BY id DESC LIMIT 20;
+-- Index used: idx_margin_calls_unresolved (partial B-tree)
+
+-- 3. Action audit trail for a margin call
+SELECT actor_id, action_type, notes, created_at
+FROM margin_call_actions
+WHERE margin_call_id = :call_id
+ORDER BY created_at ASC;
+-- Add index: idx_margin_call_actions_call ON margin_call_actions(margin_call_id)
+```
+
+#### E. NoSQL Decision
 Transactional integrity is managed in **PostgreSQL**.
 We use **Redis** (NoSQL Key-Value Store) for caching real-time stock prices `price:{ticker}` to calculate Mark-to-Market (MTM) without querying historical databases.
 
@@ -243,18 +271,52 @@ AlertService (Service)
     executeAction(alertId: long, action: ActionType, notes: String): void
 ```
 
-### B. Formal Entity Relationships
+### B. Dependency Injection Wiring Table
+
+| Class | Depends On (Interface) | Injected Impl |
+|---|---|---|
+| `RiskController` | `RiskEvaluationService` | `RiskEvaluationService` (Spring Bean) |
+| `AlertController` | `AlertService` | `AlertService` (Spring Bean) |
+| `RiskEvaluationService` | `RiskPolicyRepository` | `JpaRiskPolicyRepository` |
+| `RiskEvaluationService` | `PriceProvider` | `RedisPriceProvider` |
+| `AlertService` | `MarginCallRepository` | `JpaMarginCallRepository` |
+| `AlertService` | `OutboxEventRepository` | `JpaOutboxEventRepository` |
+
+### C. Formal Entity Relationships
 *   **Composition:** `MarginCall` owns `MarginCallAction`. Actions (like notification status updates) are strictly dependent on the existence of a parent margin call alert.
 *   **Aggregation:** `MarginAccount` has a collection of `PositionHoldings`. Holdings can change, clear, or exist separately from the specific risk parameters.
 *   **Association:** `MarginAccount` has a One-to-Many association with `PositionHoldings`.
 *   **Inheritance/Realization:** `RiskEvaluator` depends on a `PriceProvider` interface, which is realized by `RedisPriceProvider`.
 
-### C. Applied Design Patterns
+### D. State Transition Table
+
+| Current State | Trigger / Event | Next State | Guard Condition |
+|---|---|---|---|
+| `HEALTHY` (account) | `valuationBreached()` | `WARNING` | equity < 40% of outstanding_debt |
+| `WARNING` (account) | `valuationBreached()` | `BREACHED` | equity < 30% of outstanding_debt (MML) |
+| `BREACHED` (account) | `collateralDeposited()` | `HEALTHY` | new equity >= MML |
+| `PENDING` (call) | `notifySent()` | `NOTIFIED` | alert published to Kafka |
+| `NOTIFIED` (call) | `collateralReceived()` | `COLLATERAL_RECEIVED` | within deadline |
+| `NOTIFIED` (call) | `executiveResolve()` | `EXECUTIVE_RESOLVED` | risk officer action |
+| `NOTIFIED` (call) | `liquidate()` | `LIQUIDATED` | deadline passed; FOR UPDATE lock held |
+| `COLLATERAL_RECEIVED` | `executiveResolve()` | `EXECUTIVE_RESOLVED` | manual close |
+
+### E. Applied Design Patterns
 *   **Observer Pattern on AlertService:** When a margin call is triggered, the system notifies dashboard widgets, the risk desk, and sends SMS alerts to clients via Kafka consumers.
 *   **Strategy Pattern on CollateralValueCalculator:** Different asset categories (equities, cash equivalents, mutual funds) require different discount calculations. The engine uses strategy classes to calculate haircut values.
 *   **Transactional Outbox Pattern:** Ensures risk notifications are generated and published reliably by writing events directly to the `outbox_events` table within the Postgres database transaction.
 
-### D. Strict Coding Rules
+### F. SOLID Principles Checklist
+
+| Principle | How it shows in this design |
+|---|---|
+| S — Single Responsibility | RiskEvaluationService owns valuation math; AlertService owns call lifecycle; PositionMirrorService owns holding synchronization |
+| O — Open/Closed | CollateralValueCalculator Strategy — add MutualFundHaircutStrategy without modifying RiskEvaluationService |
+| L — Liskov Substitution | Any CollateralValueCalculator implementation (CashHaircutStrategy, EquityHaircutStrategy) is substitutable |
+| I — Interface Segregation | PriceProvider exposes only getPrice(ticker) — no unrelated market data methods |
+| D — Dependency Inversion | RiskEvaluationService depends on PriceProvider interface, not RedisPriceProvider directly |
+
+### G. Strict Coding Rules
 *   Use `BigDecimal` for computing ratio indices in calculations. Convert result thresholds back to integer paise.
 *   Use `SecureRandom` when generating alert tracking tokens.
 *   Model account risk states using the State Pattern or enums with validation rules.
@@ -300,7 +362,7 @@ When calculating ratio-based haircut adjustments:
 ## ▶ PHASE 2 — LLD PART 4 — CONCEPTUAL DIRECTORY LAYOUT
 
 ```
-com.slice.risk
+com.clearstreet.risk
 ├── controller/
 │   ├── RiskController.java          # API endpoints for executive portals
 │   └── AlertController.java         # API routes for alert status actions
@@ -336,3 +398,5 @@ com.slice.risk
     *   *Verbal response:* "Optimistic locking is ideal for low-contention operations that can easily be retried. However, for executive actions like triggering liquidation, a conflict retry error is unacceptable. If two executives click 'Liquidate' at the same time, we need the first to lock the row, change the status, and force the second to receive an 'Already Actioned' error. Pessimistic locking (`FOR UPDATE`) guarantees execution serialization."
 *   **"Why relational DB over NoSQL for risk mirroring?"**
     *   *Verbal response:* "Risk valuation depends on strict integrity between accounts, positions, risk policies, and active alerts. If we used an eventually consistent NoSQL database, we might read a stale position value while pricing updates, leading to a false margin call. PostgreSQL provides ACID compliance, supporting multi-table transactions to evaluate and update risk status atomically."
+*   **"Walk me through the SOLID principles in your design."**
+    *   *Verbal response:* "Single Responsibility: RiskEvaluationService owns only valuation math — it does not send alerts or lock accounts. AlertService owns the margin call lifecycle only. Open/Closed: CollateralValueCalculator Strategy lets us add MutualFundHaircutStrategy without modifying the evaluation engine. Liskov: any CollateralValueCalculator impl is a drop-in — the evaluator calls calculate(holding, price) and trusts the result. Interface Segregation: PriceProvider only exposes getPrice — RiskEvaluationService doesn't need to subscribe or invalidate the cache. Dependency Inversion: RiskEvaluationService depends on PriceProvider and RiskPolicyRepository interfaces — we can swap RedisPriceProvider for InMemoryPriceProvider in integration tests."

@@ -91,18 +91,20 @@ Response 401 Unauthorized:
 
 ##### B. Step-by-Step Service Communication Flow
 1. `Employee` —[HTTPS POST /v1/leaves/request]→ `API Gateway`: Submits request with dates, type, and reason.
-2. `API Gateway` —[gRPC: checkOverlap]→ `LeaveService`: Validates that dates do not conflict with existing approved requests.
-3. `API Gateway` —[gRPC: checkBalance]→ `LeaveService`: Queries balance validity.
+2. `API Gateway` —[HTTP POST /internal/leaves/check-overlap]→ `LeaveService`: Validates that dates do not conflict with existing approved requests.
+3. `API Gateway` —[HTTP GET /internal/leaves/balance?employee_id=:id&type=:type]→ `LeaveService`: Queries balance validity.
 4. `LeaveService` —[SQL SELECT]→ `PostgreSQL DB`: Retrieves current employee balances.
 5. `LeaveService` —[SQL UPDATE]→ `PostgreSQL DB`: Deducts balance and increments row version (optimistic lock).
 6. `LeaveService` —[SQL INSERT]→ `PostgreSQL DB`: Writes `leave_requests` and triggers `leave_approvals` sequence entries.
 7. `LeaveService` —[Kafka Event: LEAVE_SUBMITTED]→ `Notification Service`: Asynchronously flags manager queue.
 
-##### C. Infrastructure Topology
-* **Load Balancer:** L7 Round-robin balancer.
-* **Rate Limiter:** Token bucket limiting request creations (limit: 5 requests/min per employee).
-* **Blob Storage:** Medical certificates or attachments stored in S3.
-* **Cache Layers:** Redis caching current user balance figures.
+##### C. Tech Stack Summary
+```
+DB: PostgreSQL  [Why: optimistic locking on balances; date overlap query with composite index; multi-table transactions for balance deduction + request insert]
+Cache: Redis    [Why: cache current employee balance for fast read on dashboard — invalidated on balance mutation]
+Queue: Kafka    [Why: decouple manager notifications from the leave submission critical path]
+Read/Write: Read-heavy on balances (employees checking balance). Writes are low-frequency (once per leave request). Optimistic locking prevents double-deduction without holding DB connections.
+```
 
 ---
 
@@ -176,6 +178,34 @@ WHERE employee_id = :employee_id
   AND balance >= :deduct_days;
 ```
 
+##### D. Key Business Queries
+
+```sql
+-- 1. Employee leave history (cursor-paginated)
+SELECT id, leave_type_id, start_date, end_date, total_half_days, status, created_at
+FROM leave_requests
+WHERE employee_id = :employee_id AND id < :cursor_id
+ORDER BY id DESC LIMIT 20;
+-- Add index: idx_leave_requests_employee ON leave_requests(employee_id, id DESC)
+
+-- 2. Overlap detection query
+SELECT COUNT(*) FROM leave_requests
+WHERE employee_id = :employee_id
+  AND status NOT IN ('REJECTED', 'CANCELLED')
+  AND start_date <= :end_date
+  AND end_date >= :start_date;
+-- Index used: idx_requests_dates
+
+-- 3. Pending approvals for a manager
+SELECT lr.id, lr.employee_id, lr.start_date, lr.end_date, lr.total_half_days
+FROM leave_approvals la
+JOIN leave_requests lr ON la.request_id = lr.id
+WHERE la.approver_id = :approver_id
+  AND la.status = 'PENDING'
+ORDER BY lr.created_at ASC;
+-- Add index: idx_leave_approvals_approver ON leave_approvals(approver_id, status)
+```
+
 ---
 
 #### 🏛️ LLD PART 2 — OOD CLASS DESIGN & DESIGN PATTERNS
@@ -193,16 +223,47 @@ ApprovalHandler (Interface)
   Implemented by: ManagerApprovalHandler, HRApprovalHandler (Chain of Responsibility Pattern)
 ```
 
-##### B. Entity Relationships
+##### B. Dependency Injection Wiring Table
+
+| Class | Depends On (Interface) | Injected Impl |
+|---|---|---|
+| `LeaveController` | `LeaveRequestService` | `LeaveRequestService` (Spring Bean) |
+| `LeaveRequestService` | `LeaveRepository` | `JpaLeaveRepository` |
+| `LeaveRequestService` | `BalanceRepository` | `JpaBalanceRepository` |
+| `LeaveRequestService` | `ApprovalHandler` | `ManagerApprovalHandler` (head of chain) |
+| `ManagerApprovalHandler` | `ApprovalHandler` | `HRApprovalHandler` (next in chain) |
+
+##### C. Formal Entity Relationships
 * **Realization:** `ManagerApprovalHandler` realizes `ApprovalHandler` interface.
 * **Association:** `LeaveRequest` maps **One-to-Many** to `LeaveApproval` steps.
 * **Composition:** `LeaveRequest` lifecycle is updated using the `LeaveStateMachine`.
 
-##### C. Applied Design Patterns
+##### D. State Transition Table
+
+| Current State | Trigger / Event | Next State | Guard Condition |
+|---|---|---|---|
+| `SUBMITTED` | `routeToApproval()` | `PENDING_APPROVAL` | balance >= requested days |
+| `PENDING_APPROVAL` | `managerApprove()` | `PENDING_APPROVAL` (level 2) | manager is designated approver |
+| `PENDING_APPROVAL` | `hrApprove()` | `APPROVED` | all levels passed |
+| `PENDING_APPROVAL` | `reject()` | `REJECTED` | any level approver |
+| `APPROVED` | `cancel()` | `CANCELLED` | before start_date only |
+| `REJECTED` | — | — | terminal state |
+
+##### E. Applied Design Patterns
 * **Chain of Responsibility Pattern:** Used for dynamic multi-level approvals. Each approver class processes their level and passes it to the next step.
 * **State Pattern:** Governs state validations and blocks unauthorized transitions (e.g. `REJECTED` to `APPROVED`).
 
-##### D. Strict Coding Rules
+##### F. SOLID Principles Checklist
+
+| Principle | How it shows in this design |
+|---|---|
+| S — Single Responsibility | `LeaveRequestService` handles submission; `LeaveBalanceService` handles balance; `ApprovalHandler` handles approval routing |
+| O — Open/Closed | `ApprovalHandler` chain — add `DirectorApprovalHandler` without modifying existing handlers |
+| L — Liskov Substitution | `ManagerApprovalHandler` and `HRApprovalHandler` are substitutable `ApprovalHandler` implementations |
+| I — Interface Segregation | `LeaveRepository` exposes only `save`, `findByEmployee`, `checkOverlap` — no unrelated methods |
+| D — Dependency Inversion | `LeaveRequestService` depends on `ApprovalHandler` interface, not concrete `ManagerApprovalHandler` |
+
+##### G. Strict Coding Rules
 * Duration and balances are stored as **integers representing half-days** (avoiding floating-point math).
 
 ---
@@ -244,3 +305,12 @@ com.slice.leave
 
 * **Why use the Chain of Responsibility Pattern for approvals?**
   > *"Approval steps vary by business (e.g. Manager only, or Manager -> Director -> HR). Hardcoding these rules results in complex nested conditionals. The Chain of Responsibility pattern structures workflows as sequential handlers, making the design clean and extensible."*
+
+* **Why cursor pagination over OFFSET?**
+  > *"OFFSET requires the DB to scan and discard N rows on every page request — this degrades linearly as the page number grows. Cursor pagination (WHERE id < :cursor_id ORDER BY id DESC) uses the index directly, giving O(log N) performance regardless of page depth. For an employee's leave history that grows over years, cursor pagination keeps the query predictably fast."*
+
+* **Why relational DB over NoSQL for leave management?**
+  > *"Leave management requires ACID guarantees: the balance deduction and the leave request insert must succeed or fail together — partial writes create inconsistent state. Relational DB also gives us referential integrity (leave_approvals FK to leave_requests) and JOIN support (pending approvals query joining two tables). NoSQL's eventual consistency model is fundamentally incompatible with the balance-correctness requirement."*
+
+* **Walk me through the SOLID principles in your design.**
+  > *"Single Responsibility: `LeaveRequestService` handles only submission logic; `LeaveBalanceService` owns balance reads and writes; `ManagerApprovalHandler` and `HRApprovalHandler` each own exactly one approval level. Open/Closed: Adding a `DirectorApprovalHandler` requires writing a new class that implements `ApprovalHandler` and wiring it into the chain — no existing handler is modified. Liskov Substitution: Both `ManagerApprovalHandler` and `HRApprovalHandler` satisfy the `ApprovalHandler` contract — either can be substituted without breaking the chain. Interface Segregation: `LeaveRepository` exposes only `save`, `findByEmployee`, and `checkOverlap` — balance queries go to `BalanceRepository`, keeping interfaces narrow. Dependency Inversion: `LeaveRequestService` receives `ApprovalHandler` via constructor injection — it never references `ManagerApprovalHandler` by name."*

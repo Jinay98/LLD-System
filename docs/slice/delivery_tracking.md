@@ -83,19 +83,21 @@ Response 422 Unprocessable Entity:
 
 ##### B. Step-by-Step Service Communication Flow
 1. `Agent App` —[HTTPS POST /v1/deliveries/locations]→ `API Gateway`: Pushes GPS coordinate payload.
-2. `API Gateway` —[gRPC: saveLocation]→ `LocationService`: Forwards coordinates.
+2. `API Gateway` —[HTTP POST /internal/location/update]→ `LocationService`: Forwards coordinates.
 3. `LocationService` —[Redis HSET]→ `Redis In-Memory`: Updates the agent's current coordinates hash.
 4. `LocationService` —[Redis GEOADD]→ `Redis GeoIndex`: Registers coordinates under active agent geospatial index.
 5. `LocationService` —[Kafka Event: PATH_LOGGED]→ `Analytics Service`: Asynchronously logs position logs for path history.
 6. `Agent App` —[HTTPS PATCH /v1/deliveries/{id}/status]→ `API Gateway`: Submits transition command.
-7. `API Gateway` —[gRPC: updateStatus]→ `DeliveryService`: Processes state alteration.
+7. `API Gateway` —[HTTP PATCH /internal/deliveries/:id/status]→ `DeliveryService`: Processes state alteration.
 8. `DeliveryService` —[SQL SELECT FOR UPDATE]→ `PostgreSQL DB`: Locks order row, validates state rules, writes state update, and appends to logs.
 
-##### C. Infrastructure Topology
-* **Load Balancer:** L7 Round-robin balancer routing HTTP/WebSocket traffic.
-* **Rate Limiter:** Token bucket at Gateway limiting GPS update queries (1 request per 8 seconds per driver).
-* **Blob Storage:** Completed route paths compressed to a polyline string and archived in S3.
-* **Cache Layers:** Redis is the primary store for live agent coordinate caching.
+##### C. Tech Stack Summary
+```
+DB: PostgreSQL  [Why: ACID state transitions for deliveries; append-only status log for audit]
+Cache: Redis    [Why: primary store for GPS coordinates (1K writes/sec) and geospatial queries — PostgreSQL cannot handle this write rate]
+Queue: Kafka    [Why: decouple path history logging from the hot GPS ingestion path]
+Read/Write: Write-heavy on location (1K/sec GPS pings). Reads from Redis cache only. PostgreSQL handles state transitions at low TPS.
+```
 
 ---
 
@@ -154,6 +156,30 @@ WHERE id = :id
   AND status NOT IN ('DELIVERED', 'FAILED');
 ```
 
+##### D. Key Business Queries
+
+```sql
+-- 1. Active deliveries for an agent (cursor-paginated)
+SELECT id, order_id, status, created_at
+FROM deliveries
+WHERE agent_id = :agent_id AND id < :cursor_id
+  AND status NOT IN ('DELIVERED', 'FAILED')
+ORDER BY id DESC LIMIT 20;
+-- No dedicated index shown — add: idx_deliveries_agent_status ON deliveries(agent_id, status)
+
+-- 2. Delivery audit trail
+SELECT status, latitude, longitude, created_at
+FROM delivery_status_log
+WHERE delivery_id = :delivery_id
+ORDER BY created_at ASC;
+
+-- 3. SLA breach check — deliveries stuck in PICKED_UP for > 60 min
+SELECT id, order_id, agent_id, updated_at
+FROM deliveries
+WHERE status = 'PICKED_UP'
+  AND updated_at < NOW() - INTERVAL '60 minutes';
+```
+
 ---
 
 #### 🏛️ LLD PART 2 — OOD CLASS DESIGN & DESIGN PATTERNS
@@ -172,14 +198,52 @@ DeliveryStateMachine (Domain)
   Methods: validate(current: DeliveryStatus, target: DeliveryStatus)
 ```
 
-##### B. Entity Relationships
+##### B. Dependency Injection Wiring Table
+
+| Class | Depends On (Interface) | Injected Impl |
+|---|---|---|
+| `DeliveryController` | `DeliveryService` | `DeliveryService` (Spring Bean) |
+| `LocationController` | `LocationService` | `LocationService` (Spring Bean) |
+| `DeliveryService` | `DeliveryRepository` | `JpaDeliveryRepository` |
+| `DeliveryService` | `DeliveryStateMachine` | `DeliveryStateMachine` (singleton) |
+| `DispatchService` | `AgentAssignmentStrategy` | `NearestAgentStrategy` |
+
+##### C. Formal Entity Relationships
 * **Realization:** `NearestAgentStrategy` implements `AgentAssignmentStrategy` interface.
 * **Association:** `Delivery` maps **One-to-Many** to `DeliveryStatusLog` records.
 * **Composition:** `DeliveryStateMachine` is associated with `DeliveryService` state validation.
 
-##### C. Applied Design Patterns
+##### D. State Transition Table
+
+| Current State | Trigger / Event | Next State | Guard Condition |
+|---|---|---|---|
+| `ASSIGNED` | `accept()` | `ACCEPTED` | agent must be the assigned agent |
+| `ACCEPTED` | `arriveAtStore()` | `ARRIVED_AT_STORE` | none |
+| `ARRIVED_AT_STORE` | `pickUp()` | `PICKED_UP` | none |
+| `PICKED_UP` | `deliver()` | `DELIVERED` | none |
+| `PICKED_UP` | `fail()` | `FAILED` | none |
+| `DELIVERED` | — | — | terminal state |
+| `FAILED` | — | — | terminal state |
+
+##### E. Applied Design Patterns
 * **Strategy Pattern:** Used for flexible driver matching algorithms (e.g. nearest vs. load balanced).
 * **State Pattern:** Governs state validations, blocking illegal transitions (e.g. `ASSIGNED` directly to `DELIVERED`).
+
+##### F. SOLID Principles Checklist
+
+| Principle | How it shows in this design |
+|---|---|
+| S — Single Responsibility | `DeliveryService` owns state transitions; `LocationService` owns GPS ingestion; `DeliveryRepository` owns data access |
+| O — Open/Closed | `AgentAssignmentStrategy` interface — add `LoadBalancedStrategy` without modifying `DispatchService` |
+| L — Liskov Substitution | `NearestAgentStrategy` and `LoadBalancedStrategy` are drop-in replacements for `AgentAssignmentStrategy` |
+| I — Interface Segregation | `DeliveryRepository` exposes only `findByIdForUpdate` and `save` — no unrelated bulk query methods |
+| D — Dependency Inversion | `DispatchService` depends on `AgentAssignmentStrategy` interface, not `NearestAgentStrategy` directly |
+
+##### G. Strict Coding Rules
+* Use `BigDecimal` for all monetary or precise decimal arithmetic — NEVER float/double.
+* Model delivery status using strict enums with `DeliveryStateMachine` enforcing validated transition guards — never raw string comparisons.
+* Repositories must be interfaces — never inject JPA implementation classes directly into services.
+* All state-changing endpoints must accept and persist an `X-Idempotency-Key` header to prevent duplicate transitions on retries.
 
 ---
 
@@ -220,3 +284,12 @@ com.slice.delivery
 
 * **How do we handle high read loads for active orders?**
   > *"Client tracking pages query coordinates from the Redis cache (`agent_loc:{agent_id}`) directly instead of querying the relational database. This isolates read spikes from the primary database, keeping it fast."*
+
+* **Why cursor pagination over OFFSET?**
+  > *"OFFSET forces the database to scan and discard all preceding rows on every page request — at page 100 with 20 rows per page, PostgreSQL scans 2,000 rows before returning 20. Cursor pagination uses `WHERE id < :cursor_id ORDER BY id DESC LIMIT 20`, which hits the primary key B-tree index directly and performs consistently regardless of page depth. It also avoids row duplication when new records are inserted between page requests."*
+
+* **Why relational DB for delivery state, NoSQL for location?**
+  > *"Delivery state transitions require ACID guarantees — we must atomically validate the current state, write the new state, and append a status log row. If any step fails, all must roll back. PostgreSQL gives us this via a single transaction. GPS coordinates are stateless, write-only at 1K/sec, and only the latest value matters — there is no relationship to enforce. Redis handles this at in-memory speed with a simple HSET/GEOADD. Using PostgreSQL for GPS pings would saturate WAL and degrade transactional query performance."*
+
+* **Walk me through the SOLID principles in your design.**
+  > *"Single Responsibility: `DeliveryService` handles state transitions, `LocationService` handles GPS ingestion, and `DeliveryRepository` handles data access — each class has one reason to change. Open/Closed: `AgentAssignmentStrategy` is an interface — I can add `LoadBalancedStrategy` without touching `DispatchService`. Liskov Substitution: `NearestAgentStrategy` and `LoadBalancedStrategy` are interchangeable implementations of `AgentAssignmentStrategy` — swapping one for the other does not break the caller. Interface Segregation: `DeliveryRepository` exposes only `findByIdForUpdate` and `save` — services are not forced to depend on bulk query methods they don't use. Dependency Inversion: `DispatchService` depends on the `AgentAssignmentStrategy` interface, not the concrete `NearestAgentStrategy` — the concrete impl is injected at runtime by Spring."*

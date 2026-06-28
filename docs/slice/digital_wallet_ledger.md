@@ -80,18 +80,20 @@ Response 200 OK:
 
 ##### B. Step-by-Step Service Communication Flow
 1. `Client` —[HTTPS POST /v1/wallets/transfers]→ `API Gateway`: Submits payload with JWT and unique Idempotency-Key.
-2. `API Gateway` —[gRPC: authenticate]→ `UserService`: Validates token and checks if user profile is active.
-3. `API Gateway` —[gRPC: checkLimits]→ `LimitService`: Verifies that the transfer amount does not exceed the sender's daily transaction limit.
-4. `API Gateway` —[gRPC: executeTransfer]→ `WalletService`: Forwards the request parameters.
+2. `API Gateway` —[HTTP POST /internal/auth/validate]→ `UserService`: Validates token and checks if user profile is active.
+3. `API Gateway` —[HTTP GET /internal/limits/check?user_id=:id&amount=:amount]→ `LimitService`: Verifies that the transfer amount does not exceed the sender's daily transaction limit.
+4. `API Gateway` —[HTTP POST /internal/wallets/transfer]→ `WalletService`: Forwards the request parameters.
 5. `WalletService` —[SQL SELECT FOR UPDATE]→ `PostgreSQL DB`: Acquires exclusive row locks on sender and receiver wallets in sorted order.
 6. `WalletService` —[SQL INSERT]→ `PostgreSQL DB`: Adds double-entry ledger rows and updates cached wallet balances.
 7. `WalletService` —[Kafka Event: TXN_COMMITTED]→ `Notification Service`: Asynchronously publishes event to send SMS and email confirmations.
 
-##### C. Infrastructure Topology
-* **Load Balancer:** Layer 7 (Application) LB using round-robin routing with path-based rules.
-* **Rate Limiter:** Redis-based token bucket algorithm sitting at the API Gateway layer (rate limit: 50 requests/min per user profile).
-* **Blob Storage:** Monthly statement PDFs archived and stored in AWS S3 with read-only signed URLs.
-* **Cache Layers:** Redis cache for fast point lookup of wallet balances with dynamic TTL invalidation upon mutations.
+##### C. Tech Stack Summary
+```
+DB: PostgreSQL  [Why: ACID transactions for ledger; JOIN for wallet ↔ entries reconciliation]
+Cache: Redis    [Why: balance reads on hot path; avoids lock contention on SELECT]
+Queue: Kafka    [Why: decouple audit/notification from critical write path; durable, replayable]
+Read/Write: Write-heavy (every transfer = 2 ledger entries + 2 wallet updates). Handled via connection pooling + pessimistic row-lock scope minimized to balance update only.
+```
 
 ---
 
@@ -163,6 +165,35 @@ BEGIN;
 COMMIT;
 ```
 
+##### D. Key Business Queries
+
+```sql
+-- 1. Transaction history (cursor-paginated)
+SELECT id, amount, entry_type, description, transaction_ref, created_at
+FROM ledger_entries
+WHERE wallet_id = :wallet_id AND id < :cursor_id
+ORDER BY id DESC LIMIT 20;
+-- Index used: idx_ledger_wallet_time
+
+-- 2. Balance audit — verify wallet balance == sum of ledger entries
+SELECT
+  w.id AS wallet_id,
+  w.balance AS cached_balance,
+  SUM(CASE WHEN le.entry_type = 'CREDIT' THEN le.amount ELSE -le.amount END) AS computed_balance,
+  (w.balance - SUM(CASE WHEN le.entry_type = 'CREDIT' THEN le.amount ELSE -le.amount END)) AS drift
+FROM wallets w
+JOIN ledger_entries le ON le.wallet_id = w.id
+WHERE w.id = :wallet_id
+GROUP BY w.id, w.balance;
+
+-- 3. Daily debit volume (last 30 days)
+SELECT DATE(created_at) AS txn_date, COUNT(*) AS txn_count, SUM(amount) AS total_volume_paise
+FROM ledger_entries
+WHERE entry_type = 'DEBIT' AND created_at >= NOW() - INTERVAL '30 days'
+GROUP BY DATE(created_at)
+ORDER BY txn_date DESC;
+```
+
 ---
 
 #### 🏛️ LLD PART 2 — OOD CLASS DESIGN & DESIGN PATTERNS
@@ -181,16 +212,36 @@ WalletService (Service)
   Methods: transfer(senderId: long, receiverId: long, amount: BigDecimal, key: String): TransactionResult
 ```
 
-##### B. Entity Relationships
+##### B. Dependency Injection Wiring Table
+
+| Class | Depends On (Interface) | Injected Impl |
+|---|---|---|
+| `WalletController` | `WalletService` | `WalletService` (Spring Bean) |
+| `WalletService` | `WalletRepository` | `JpaWalletRepository` |
+| `WalletService` | `LedgerRepository` | `JpaLedgerRepository` |
+| `WalletService` | `LimitValidationStrategy` | `DailyLimitStrategy` / `VIPLimitStrategy` |
+| `WalletService` | `IdempotencyRepository` | `JpaIdempotencyRepository` |
+
+##### C. Formal Entity Relationships
 * **Aggregation:** `Wallet` has `LedgerEntry` objects (association, ledger entries can exist as records even if a wallet is soft-deleted).
 * **Composition:** `IdempotencyRecord` is managed by `WalletService` transactions.
 * **Association:** `Wallet` maps **One-to-Many** to `LedgerEntry`.
 
-##### C. Applied Design Patterns
+##### E. Applied Design Patterns
 * **Strategy Pattern:** Implemented at validation layer (`LimitValidationStrategy` with concrete options like `DailyLimitStrategy` or `VIPLimitStrategy`).
 * **Factory Pattern:** Used to generate matching ledger debit/credit entries inside transactional flows.
 
-##### D. Strict Coding Rules
+##### F. SOLID Principles Checklist
+
+| Principle | How it shows in this design |
+|---|---|
+| S — Single Responsibility | WalletController handles HTTP, WalletService owns transfer logic, WalletRepository owns data access |
+| O — Open/Closed | LimitValidationStrategy interface — add DailyLimitStrategy or VIPLimitStrategy without modifying WalletService |
+| L — Liskov Substitution | Any LimitValidationStrategy impl is a drop-in replacement; callers need not change |
+| I — Interface Segregation | WalletRepository exposes only findByIdForUpdate and save — no fat interface methods |
+| D — Dependency Inversion | WalletService depends on WalletRepository interface, not JpaWalletRepository directly |
+
+##### G. Strict Coding Rules
 * Base monetary calculations utilize Java's `BigDecimal` to ensure absolute decimal precision.
 * Secure token validations utilize `SecureRandom`.
 
@@ -240,3 +291,9 @@ com.slice.wallet
 
 * **Why choose Pessimistic over Optimistic locking?**
   > *"Optimistic locking fails updates if a version conflict occurs, forcing a client rollback and retry. During financial transactions, balance updates are highly contentious. Making clients retry transfers on concurrent writes yields terrible user experiences. Pessimistic locking blocks requests and queues them sequentially, ensuring reliable completion."*
+
+* **Why relational DB over NoSQL for ledgers?**
+  > *"Ledger correctness depends on three guarantees NoSQL cannot provide cheaply: ACID transactions (debit and credit must atomically succeed or fail together), JOIN semantics (wallet balance must reconcile against the sum of ledger entries in a single query), and referential integrity (a ledger entry must always reference a valid wallet). Implementing these in a document or key-value store requires application-level workarounds that introduce new failure modes. PostgreSQL gives us all three natively."*
+
+* **Walk me through the SOLID principles in your design.**
+  > *"Single Responsibility: each layer owns exactly one concern — WalletController handles HTTP marshalling, WalletService owns transfer business logic, WalletRepository owns data access. Open/Closed: the LimitValidationStrategy interface lets us add DailyLimitStrategy or VIPLimitStrategy without touching WalletService. Liskov Substitution: any concrete strategy is a drop-in replacement — the service does not need to know which impl it receives. Interface Segregation: WalletRepository only exposes findByIdForUpdate and save — no methods the service does not need. Dependency Inversion: WalletService depends on the WalletRepository interface, not JpaWalletRepository directly, making it trivial to swap in an in-memory stub for unit tests."*
