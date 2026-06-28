@@ -82,19 +82,21 @@ Response 200 OK:
 
 ##### B. Step-by-Step Service Communication Flow
 1. `Client` —[HTTPS POST /v1/expenses]→ `API Gateway`: Submits expense details, split mappings, and idempotency key.
-2. `API Gateway` —[gRPC: validateGroup]→ `GroupService`: Verifies if the group exists and participants are members.
-3. `API Gateway` —[gRPC: addExpense]→ `ExpenseService`: Forwards the request parameters.
+2. `API Gateway` —[HTTP GET /internal/groups/:group_id/validate-members]→ `GroupService`: Verifies if the group exists and participants are members.
+3. `API Gateway` —[HTTP POST /internal/expenses]→ `ExpenseService`: Forwards the request parameters.
 4. `ExpenseService` —[Strategy validation]→ `ExpenseService`: Validates split inputs against rules (e.g. sum checks).
 5. `ExpenseService` —[SQL Transaction]→ `PostgreSQL DB`: Inserts expense record and split rows.
 6. `ExpenseService` —[Kafka Event: EXPENSE_CREATED]→ `BalanceService`: Asynchronously emits creation event.
 7. `BalanceService` —[SQL SELECT FOR UPDATE]→ `PostgreSQL DB`: Acquires exclusive locks on pairwise relations in strict user order.
 8. `BalanceService` —[SQL UPDATE]→ `PostgreSQL DB`: Updates cached balance cells representing who owes whom.
 
-##### C. Infrastructure Topology
-* **Load Balancer:** L7 LB routing request traffic to application nodes.
-* **Rate Limiter:** Token bucket limiting card checkout or entry creation spikes (15 requests/min per user).
-* **Blob Storage:** Receipt invoice images uploaded and stored in S3, linked via URL inside metadata.
-* **Cache Layers:** Redis caching user balance structures, invalidated when new expenses are compiled.
+##### C. Tech Stack Summary
+```
+DB: PostgreSQL  [Why: pessimistic locking on user_balances for concurrent split updates; ACID for expense + split inserts]
+Cache: Redis    [Why: cache user net balance for fast dashboard reads — invalidated on new expense creation]
+Queue: Kafka    [Why: decouple balance recalculation from the expense creation critical path for large groups]
+Read/Write: Read-heavy on balances. Writes are burst on new expense creation (N pairwise balance rows updated per expense). Handled via pessimistic locking in sorted user order.
+```
 
 ---
 
@@ -172,6 +174,31 @@ SET balance = balance + :delta_amount
 WHERE user_a = :user_a AND user_b = :user_b;
 ```
 
+##### D. Key Business Queries
+
+```sql
+-- 1. Group expense history (cursor-paginated)
+SELECT id, paid_by, total_amount, split_type, description, created_at
+FROM expenses
+WHERE group_id = :group_id AND id < :cursor_id
+ORDER BY id DESC LIMIT 20;
+-- Index used: idx_expense_group ON expenses(group_id, created_at DESC)
+
+-- 2. Net balance for a user (all pairwise balances)
+SELECT 
+  CASE WHEN user_a = :user_id THEN user_b ELSE user_a END AS counterparty_id,
+  CASE WHEN user_a = :user_id THEN balance ELSE -balance END AS net_balance
+FROM user_balances
+WHERE user_a = :user_id OR user_b = :user_id;
+-- Index: PRIMARY KEY (user_a, user_b) — range scan on user_a, merge with user_b results
+
+-- 3. Splits for a specific expense
+SELECT user_id, amount_owed, percentage
+FROM expense_splits
+WHERE expense_id = :expense_id;
+-- Add index: idx_expense_splits_expense ON expense_splits(expense_id)
+```
+
 ---
 
 #### 🏛️ LLD PART 2 — OOD CLASS DESIGN & DESIGN PATTERNS
@@ -194,16 +221,35 @@ BalanceSheetManager (Service)
   Methods: simplifyDebts(groupId: long): List<DebtSettlement>
 ```
 
-##### B. Entity Relationships
+##### B. Dependency Injection Wiring Table
+
+| Class | Depends On (Interface) | Injected Impl |
+|---|---|---|
+| `ExpenseController` | `ExpenseService` | `ExpenseService` (Spring Bean) |
+| `ExpenseService` | `ExpenseRepository` | `JpaExpenseRepository` |
+| `ExpenseService` | `SplitStrategy` | `EqualSplitStrategy` / `ExactSplitStrategy` / `PercentageSplitStrategy` |
+| `BalanceSheetManager` | `BalanceRepository` | `JpaBalanceRepository` |
+
+##### C. Formal Entity Relationships
 * **Realization:** `EqualSplitStrategy` realizes `SplitStrategy`.
 * **Composition:** `Expense` owns instances of `Split` objects. They cannot exist without the parent.
 * **Association:** `Expense` maps **One-to-Many** to `Split` entries.
 
-##### C. Applied Design Patterns
+##### E. Applied Design Patterns
 * **Strategy Pattern:** `SplitStrategy` encapsulates parsing rules per splitting type.
 * **Factory Pattern:** `SplitStrategyFactory` generates matching strategy logic classes.
 
-##### D. Strict Coding Rules
+##### F. SOLID Principles Checklist
+
+| Principle | How it shows in this design |
+|---|---|
+| S — Single Responsibility | `ExpenseService` handles expense creation; `BalanceSheetManager` handles balance updates; `SplitStrategy` handles split validation |
+| O — Open/Closed | `SplitStrategy` interface — add `PercentageSplitStrategy` without modifying `ExpenseService` |
+| L — Liskov Substitution | `EqualSplitStrategy`, `ExactSplitStrategy`, `PercentageSplitStrategy` are interchangeable `SplitStrategy` implementations |
+| I — Interface Segregation | `ExpenseRepository` exposes only `save` and `findByGroup` — no unrelated user-balance methods |
+| D — Dependency Inversion | `ExpenseService` depends on `SplitStrategy` interface — the concrete class is injected via `SplitStrategyFactory` |
+
+##### G. Strict Coding Rules
 * Precision balance math uses `BigDecimal`.
 * Rounded split remainders are distributed back to the payer (see Part 3).
 
@@ -250,3 +296,12 @@ com.slice.splitwise
 
 * **How do we handle multi-currency transactions?**
   > *"We choose a base currency (INR) for user relationships. If an expense is entered in USD, we query the conversion rate api at checkout, convert values to base INR paise, write calculations to database entries, and log original input fields in a metadata payload."*
+
+* **Why cursor pagination over OFFSET?**
+  > *"OFFSET requires the DB to scan and discard N rows on every page — performance degrades linearly as page depth grows. Cursor pagination (WHERE id < :cursor_id ORDER BY id DESC) hits the index directly, giving O(log N) performance regardless of page number. For group expense history that grows indefinitely, cursor pagination keeps the query predictably fast at any scale."*
+
+* **Why relational DB over NoSQL for split expenses?**
+  > *"Each expense creation involves multiple writes: inserting the expense row, inserting N expense_split rows, and updating M pairwise user_balance rows. These must all succeed or all fail — ACID transactions are non-negotiable. We also need referential integrity (expense_splits FK to expenses prevents orphaned rows) and JOIN support for expense history. NoSQL's eventual consistency model cannot safely guarantee balance correctness across concurrent writes."*
+
+* **Walk me through the SOLID principles in your design.**
+  > *"Single Responsibility: `ExpenseService` handles only expense creation; `BalanceSheetManager` exclusively owns balance reads, updates, and debt simplification; `SplitStrategy` implementations handle only the math validation for their respective split type. Open/Closed: Adding a new split type — say SHARES-based splitting — means writing a new `SharesSplitStrategy` class that implements `SplitStrategy`, then wiring it into `SplitStrategyFactory`; `ExpenseService` is untouched. Liskov Substitution: `EqualSplitStrategy`, `ExactSplitStrategy`, and `PercentageSplitStrategy` all satisfy the `validateSplits` contract and can be swapped without changing `ExpenseService`. Interface Segregation: `ExpenseRepository` exposes only `save` and `findByGroup`; balance queries are routed to `BalanceRepository` — no interface carries methods unrelated to its domain. Dependency Inversion: `ExpenseService` receives a `SplitStrategy` via `SplitStrategyFactory` injection — it never references a concrete strategy class directly."*

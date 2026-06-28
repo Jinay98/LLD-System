@@ -87,9 +87,9 @@ Response 200 OK:
 
 #### B. Step-by-Step Service Communication Flow
 1. `Client` —[HTTPS POST /v1/orders]→ `API Gateway`: Submits order with JWT and `X-Idempotency-Key`.
-2. `API Gateway` —[gRPC]→ `Order Service`: Authorizes user and forwards order.
+2. `API Gateway` —[HTTP POST /internal/orders/validate]→ `Order Service`: Authorizes user and forwards order.
 3. `Order Service` —[Redis GET price:{ticker}]→ `Price Cache`: Fetches real-time price to validate price thresholds.
-4. `Order Service` —[gRPC Reserve]→ `Wallet Service` (for BUY) or `Portfolio Service` (for SELL): Requests resource reservation.
+4. `Order Service` —[HTTP POST /internal/wallets/:userId/reserve]→ `Wallet Service` (for BUY) or —[HTTP POST /internal/portfolios/:userId/reserve]→ `Portfolio Service` (for SELL): Requests resource reservation.
 5. `Wallet Service` —[SQL SELECT FOR UPDATE]→ `PostgreSQL DB`: Locks user's wallet, verifies funds, and shifts money from `balance_in_paise` to `locked_balance_in_paise`.
 6. `Order Service` —[SQL INSERT]→ `Order PostgreSQL DB`: Creates `PENDING` order record.
 7. `Order Service` —[Kafka Event: order_placed]→ `Kafka Broker`: Publishes order details.
@@ -97,11 +97,13 @@ Response 200 OK:
 9. `Matching Service` —[Kafka Event: trade_executed]→ `Kafka Broker`: Emits execution parameters.
 10. `Order Service` —[Kafka Consumer]→ `Order DB`: Receives execution event, triggers atomic settlement transaction updating order state, wallet cash releases, portfolio shares, and inserts `executions` log.
 
-#### C. Infrastructure Topology
-*   **Load Balancer:** Application Load Balancer (ALB) using Weighted Round-Robin routing to balance traffic across API gateways.
-*   **Rate Limiter:** Token Bucket algorithm implemented in Redis. Configured at 100 order placements per minute per user to throttle bots.
-*   **Blob Storage:** AWS S3 used for archiving daily trade books, end-of-day execution reports, and monthly statement PDFs.
-*   **Cache Layers:** Redis Cluster caching stock price quotes (1-sec TTL, volatile-lru eviction) and tracking API idempotency keys (24-hour TTL).
+#### C. Tech Stack Summary
+```
+DB: PostgreSQL  [Why: ACID for fund reservation and execution settlement; UNIQUE on idempotency_key prevents duplicate orders]
+Cache: Redis    [Why: real-time stock price quotes (1-sec TTL); idempotency fast-path checks (24-hour TTL)]
+Queue: Kafka    [Why: decouple matching engine from order service; decouple settlement notifications from trade execution path]
+Read/Write: Write-heavy during market hours (5K TPS). Critical path: reserve funds → insert order → publish to Kafka. Settlement happens async via Kafka consumer.
+```
 
 ---
 
@@ -229,7 +231,35 @@ WHERE id = :order_id
 -- Checks rows affected; if 0, the order has already been matched or filled.
 ```
 
-#### D. NoSQL Decision
+#### D. Key Business Queries
+
+```sql
+-- 1. Open orders for a ticker (matching engine query, cursor-paginated)
+SELECT id, user_id, side, order_type, limit_price_in_paise, quantity, filled_quantity
+FROM orders
+WHERE ticker = :ticker
+  AND status IN ('PENDING', 'PARTIALLY_FILLED')
+  AND id < :cursor_id
+ORDER BY id DESC LIMIT 100;
+-- Index used: idx_orders_ticker_status (partial B-tree)
+
+-- 2. User order history (cursor-paginated)
+SELECT id, ticker, side, order_type, quantity, filled_quantity, status, created_at
+FROM orders
+WHERE user_id = :user_id AND id < :cursor_id
+ORDER BY id DESC LIMIT 20;
+-- Add index: idx_orders_user ON orders(user_id, id DESC)
+
+-- 3. Reconciliation — expected portfolio vs. actual
+SELECT 
+  (COALESCE(SUM(exec_quantity) FILTER (WHERE buyer_id = :user_id), 0) - 
+   COALESCE(SUM(exec_quantity) FILTER (WHERE seller_id = :user_id), 0)) AS expected_quantity
+FROM executions 
+WHERE ticker = :ticker;
+-- Compare against portfolio_holdings.quantity for drift detection
+```
+
+#### E. NoSQL Decision
 Relational PostgreSQL is the primary database for orders, wallets, holdings, and executions to ensure ACID transactions. 
 We use **Redis** (NoSQL Key-Value Store) for caching stock price streams to prevent high write throughput from degrading RDBMS performance.
 ```
@@ -281,18 +311,55 @@ TradeSettler (Service)
     settle(buyerId: long, sellerId: long, ticker: String, quantity: int, price: long, txId: String): ExecutionRecord
 ```
 
-### B. Formal Entity Relationships
+### B. Dependency Injection Wiring Table
+
+| Class | Depends On (Interface) | Injected Impl |
+|---|---|---|
+| `OrderController` | `OrderService` | `OrderService` (Spring Bean) |
+| `OrderService` | `OrderRepository` | `JpaOrderRepository` |
+| `OrderService` | `OrderValidator` | `LimitOrderValidator`, `MarketOrderValidator` |
+| `OrderService` | `WalletRepository` | `JpaWalletRepository` |
+| `TradeSettler` | `WalletRepository` | `JpaWalletRepository` |
+| `TradeSettler` | `PortfolioRepository` | `JpaPortfolioRepository` |
+| `TradeSettler` | `OutboxEventRepository` | `JpaOutboxEventRepository` |
+
+### C. Formal Entity Relationships
 *   **Composition:** `Order` owns `Execution`. If an order is deleted, its execution records are deleted or archived with it; executions cannot exist without an order.
 *   **Aggregation:** `Wallet` has a collection of `LedgerEntries`. If the wallet object is cleared from memory, ledger entries remain in the database as historical records.
 *   **Association:** `Wallet` and `User` maintain a One-to-One association. `Order` maintains a Many-to-One association with `User`.
 *   **Inheritance/Realization:** `LimitOrderValidator` and `MarketOrderValidator` realize the `OrderValidator` interface.
 
-### C. Applied Design Patterns
+### D. State Transition Table
+
+| Current State | Trigger / Event | Next State | Guard Condition |
+|---|---|---|---|
+| `PENDING` | `partialFill(qty)` | `PARTIALLY_FILLED` | filled_quantity < quantity |
+| `PENDING` | `fullFill(qty)` | `FILLED` | filled_quantity == quantity |
+| `PARTIALLY_FILLED` | `additionalFill(qty)` | `PARTIALLY_FILLED` | still not fully filled |
+| `PARTIALLY_FILLED` | `finalFill(qty)` | `FILLED` | filled_quantity == quantity |
+| `PENDING` | `cancel()` | `CANCELLED` | optimistic lock check (version) |
+| `PARTIALLY_FILLED` | `cancel()` | `CANCELLED` | optimistic lock check |
+| `PENDING` | `reject()` | `REJECTED` | insufficient funds or invalid price |
+| `FILLED` | — | — | terminal state |
+| `CANCELLED` | — | — | terminal state |
+| `REJECTED` | — | — | terminal state |
+
+### E. Applied Design Patterns
 *   **Strategy Pattern on OrderValidator:** Wraps order validation logic in concrete classes depending on the order side and type. This allows adding new types (such as stop-loss or options) without changing existing core order placement logic.
 *   **State Pattern on OrderStatus:** Manages transitions between order states (`PENDING`, `PARTIALLY_FILLED`, `FILLED`, `CANCELLED`). This prevents invalid lifecycle state jumps.
 *   **Transactional Outbox Pattern on TradeSettler:** Writes business events (e.g., trade executions) to an `outbox_events` table within the same PostgreSQL transaction that updates balances, ensuring eventual delivery to Kafka.
 
-### D. Strict Coding Rules
+### F. SOLID Principles Checklist
+
+| Principle | How it shows in this design |
+|---|---|
+| S — Single Responsibility | OrderService handles order lifecycle; TradeSettler handles atomic settlement; OrderValidator handles price/fund validation |
+| O — Open/Closed | OrderValidator interface — add StopLossOrderValidator without modifying OrderService dispatch logic |
+| L — Liskov Substitution | LimitOrderValidator and MarketOrderValidator are drop-in replacements for OrderValidator |
+| I — Interface Segregation | OrderRepository exposes only save, findById, updateStatus — no unrelated portfolio methods |
+| D — Dependency Inversion | OrderService depends on OrderValidator interface, not LimitOrderValidator directly — swappable for tests |
+
+### G. Strict Coding Rules
 *   Use `BigDecimal` for precision calculations like interest fees or exchange rates in the application layer. Convert calculations back to integer paise before DB writes.
 *   Use `SecureRandom` when generating transaction tokens or API request tracking UUIDs.
 *   Model order statuses using the State Pattern or enums with validation rules.
@@ -340,7 +407,7 @@ When splitting execution fees (e.g., sharing a 10-paise regulatory fee equally a
 ## ▶ PHASE 2 — LLD PART 4 — CONCEPTUAL DIRECTORY LAYOUT
 
 ```
-com.slice.trading
+com.clearstreet.trading
 ├── controller/
 │   ├── OrderController.java         # API routes for order placement/cancellation
 │   └── WalletController.java        # Balance lookups and manual deposits
@@ -376,3 +443,5 @@ com.slice.trading
     *   *Verbal response:* "Optimistic locking assumes low contention and forces retries on conflicts. For financial wallets during active trading, transactions are frequent. Forcing users to retry payments because a concurrent update changed the version column results in a poor user experience. Pessimistic locking (`FOR UPDATE`) serializes updates on the database thread pool, queuing incoming transactions safely."
 *   **"Why relational DB over NoSQL for ledgers?"**
     *   *Verbal response:* "Financial ledgers require strict atomicity, isolation, and relational integrity. In double-entry bookkeeping, a debit on one account must balance a credit on another. If either operation fails, both must roll back. Relational databases support multi-table ACID transactions, ensuring that balances never drift. NoSQL databases are eventually consistent by default, which can lead to double-spending."
+*   **"Walk me through the SOLID principles in your design."**
+    *   *Verbal response:* "Single Responsibility: OrderService handles order lifecycle only — fund reservation delegates to Wallet Service via HTTP, settlement delegates to TradeSettler. Open/Closed: OrderValidator interface lets us add StopLossOrderValidator without touching existing validation logic. Liskov: LimitOrderValidator and MarketOrderValidator are identical drop-ins for OrderValidator. Interface Segregation: each repository interface exposes only what its consumer needs — TradeSettler's WalletRepository only has reserveFunds and settleDebit. Dependency Inversion: OrderService depends on OrderValidator and WalletRepository interfaces — concrete JPA or HTTP implementations are injected, making the service testable with in-memory stubs."

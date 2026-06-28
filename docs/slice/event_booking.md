@@ -83,7 +83,7 @@ Response 422 Unprocessable Entity:
 
 ##### B. Step-by-Step Service Communication Flow
 1. `Client` —[HTTPS POST /v1/bookings/reserve]→ `API Gateway`: Submits show ID and seat list.
-2. `API Gateway` —[gRPC: holdSeats]→ `BookingService`: Starts hold flow.
+2. `API Gateway` —[HTTP POST /internal/bookings/reserve]→ `BookingService`: Starts hold flow.
 3. `BookingService` —[Redis SETNX Loop]→ `Redis Hold Cache`: Evaluates and locks each seat with a 5-minute TTL.
 4. `BookingService` —[SQL INSERT]→ `PostgreSQL DB`: Inserts a `PENDING` booking row.
 5. `Client` —[HTTPS POST /v1/payments/charge]→ `PaymentService`: Executes payment.
@@ -91,11 +91,13 @@ Response 422 Unprocessable Entity:
 7. `BookingService` —[SQL Transaction]→ `PostgreSQL DB`: Updates `show_seats` to `BOOKED` and sets booking status to `CONFIRMED`.
 8. `BookingService` —[Kafka Event: TICKET_CONFIRMED]→ `Notification Service`: Asynchronously triggers PDF generation and sends tickets to the user.
 
-##### C. Infrastructure Topology
-* **Load Balancer:** L7 LB routing catalog reads to replicas and booking writes to active writers.
-* **Rate Limiter:** Token bucket at API gateway limiting checkout queries (limit: 5 checkouts/min per user).
-* **Blob Storage:** Generated ticket PDF/QR images stored in S3.
-* **Cache Layers:** Redis is used for fast seat-hold locks to bypass database lock contention.
+##### C. Tech Stack Summary
+```
+DB: PostgreSQL  [Why: ACID booking confirmation; UNIQUE constraint on (show_id, seat_number) as safety net]
+Cache: Redis    [Why: atomic seat holds via SET NX EX — handles 100K+ concurrent hold requests without saturating DB connections]
+Queue: Kafka    [Why: decouple ticket PDF generation and notifications from the booking confirmation path]
+Read/Write: Extremely write-heavy during flash sales (1K req/sec competing for the same rows). Redis absorbs the hot path; DB handles final confirmation only.
+```
 
 ---
 
@@ -164,6 +166,32 @@ WHERE show_id = :show_id
   AND (status = 'AVAILABLE' OR (status = 'LOCKED' AND locked_by = :user_id));
 ```
 
+##### D. Key Business Queries
+
+```sql
+-- 1. User booking history (cursor-paginated)
+SELECT b.id, b.show_id, b.status, b.total_price, b.created_at
+FROM bookings b
+WHERE b.user_id = :user_id AND b.id < :cursor_id
+ORDER BY b.id DESC LIMIT 20;
+-- Add index: idx_bookings_user ON bookings(user_id, id DESC)
+
+-- 2. Available seats for a show
+SELECT seat_number, seat_type, price
+FROM show_seats
+WHERE show_id = :show_id
+  AND status = 'AVAILABLE'
+ORDER BY seat_number ASC;
+-- Index used: UNIQUE (show_id, seat_number) covers this query
+
+-- 3. Expired lock cleanup query (cron job)
+SELECT id, show_id, seat_number
+FROM show_seats
+WHERE status = 'LOCKED'
+  AND locked_until < NOW();
+-- Add index: idx_show_seats_locked_until ON show_seats(status, locked_until) WHERE status = 'LOCKED'
+```
+
 ---
 
 #### 🏛️ LLD PART 2 — OOD CLASS DESIGN & DESIGN PATTERNS
@@ -181,14 +209,51 @@ BookingService (Service)
   Methods: reserveSeats(showId: long, seats: List<String>, userId: long): Booking
 ```
 
-##### B. Entity Relationships
+##### B. Dependency Injection Wiring Table
+
+| Class | Depends On (Interface) | Injected Impl |
+|---|---|---|
+| `BookingController` | `BookingService` | `BookingService` (Spring Bean) |
+| `BookingService` | `BookingRepository` | `JpaBookingRepository` |
+| `BookingService` | `ShowSeatRepository` | `JpaShowSeatRepository` |
+| `BookingService` | `RedisLockManager` | `RedisLockManager` (Spring Bean) |
+| `BookingService` | `NotificationObserver` | `EmailNotifier`, `SmsNotifier` |
+
+##### C. Formal Entity Relationships
 * **Composition:** `Booking` owns a collection of reserved seats.
 * **Association:** `ShowSeat` maps **Many-to-One** to `Show`.
 * **Realization:** `EmailNotifier` implements `NotificationObserver` interface.
 
-##### C. Applied Design Patterns
+##### D. State Transition Table
+
+| Current State | Trigger / Event | Next State | Guard Condition |
+|---|---|---|---|
+| `AVAILABLE` (seat) | `hold()` | `LOCKED` | Redis SETNX succeeds |
+| `LOCKED` (seat) | `confirm()` | `BOOKED` | payment callback SUCCESS + hold still valid |
+| `LOCKED` (seat) | `expire()` | `AVAILABLE` | locked_until < NOW() |
+| `PENDING` (booking) | `paymentSuccess()` | `CONFIRMED` | hold not expired |
+| `PENDING` (booking) | `holdExpired()` | `CANCELLED` | locked_until < NOW() |
+| `CONFIRMED` (booking) | `cancel()` | `CANCELLED` | within cancellation window |
+
+##### E. Applied Design Patterns
 * **Observer Pattern:** Decouples the ticket confirmation flow from SMS/Email delivery services.
 * **Factory Pattern:** Generates correct pricing mappings per seat category.
+
+##### F. SOLID Principles Checklist
+
+| Principle | How it shows in this design |
+|---|---|
+| S — Single Responsibility | `BookingService` owns reservation logic; `RedisLockManager` owns lock lifecycle; `ShowSeatRepository` owns data access |
+| O — Open/Closed | `NotificationObserver` interface — add `PushNotifier` without modifying `BookingService` confirmation flow |
+| L — Liskov Substitution | `EmailNotifier` and `SmsNotifier` are drop-in replacements for `NotificationObserver` |
+| I — Interface Segregation | `BookingRepository` exposes only `findById`, `save`, `findByUserId` — no unrelated seat query methods |
+| D — Dependency Inversion | `BookingService` depends on `BookingRepository` interface, not `JpaBookingRepository` — swappable for in-memory test impl |
+
+##### G. Strict Coding Rules
+* Use `BigDecimal` for all price arithmetic — NEVER float/double.
+* Use `SecureRandom` for booking reference token generation.
+* Model seat and booking status using State Pattern or strict enums with validated transition guards.
+* Repositories must be interfaces — never inject JPA classes directly into services.
 
 ---
 
@@ -228,3 +293,12 @@ com.slice.booking
 
 * **How do we handle double booking if Redis falls over?**
   > *"We configure Redis with Master-Replica replication and Sentinel for auto-failover. As a secondary guard, the database `show_seats` table enforces a unique constraint index on `(show_id, seat_number)` and uses optimistic version checks."*
+
+* **Why cursor pagination over OFFSET?**
+  > *"OFFSET forces the database to scan and discard all preceding rows on every page request — at page 100 with 20 rows per page, PostgreSQL scans 2,000 rows before returning 20. Cursor pagination uses `WHERE id < :cursor_id ORDER BY id DESC LIMIT 20`, which hits the primary key B-tree index directly and performs consistently regardless of page depth. It also avoids row duplication when new records are inserted between page requests."*
+
+* **Why relational DB over NoSQL for booking confirmation?**
+  > *"Booking confirmation needs ACID — we must atomically update seat status from LOCKED to BOOKED and write the booking record in one transaction. If either fails, both must roll back. PostgreSQL gives us this guarantee. Redis is used for the hot-path hold check, but the final confirmation always commits to PostgreSQL for durability and correctness."*
+
+* **Walk me through the SOLID principles in your design.**
+  > *"Single Responsibility: `BookingService` handles reservation logic, `RedisLockManager` handles lock lifecycle, and `ShowSeatRepository` handles data access — each class has one reason to change. Open/Closed: `NotificationObserver` is an interface — I can add `PushNotifier` without touching `BookingService`. Liskov Substitution: `EmailNotifier` and `SmsNotifier` are interchangeable implementations of `NotificationObserver` — swapping one for the other does not break the caller. Interface Segregation: `BookingRepository` exposes only `findById`, `save`, and `findByUserId` — services are not forced to depend on seat query methods they don't use. Dependency Inversion: `BookingService` depends on the `BookingRepository` interface, not `JpaBookingRepository` directly — the concrete impl is injected by Spring and can be swapped for an in-memory test implementation."*

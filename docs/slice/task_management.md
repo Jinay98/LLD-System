@@ -91,19 +91,21 @@ Response 422 Unprocessable Entity:
 
 ##### B. Step-by-Step Service Communication Flow
 1. `Client` —[HTTPS PATCH /v1/tasks/{taskId}/status]→ `API Gateway`: Submits request with target state, version, and reason.
-2. `API Gateway` —[gRPC: checkAccess]→ `UserService`: Validates requester roles and permissions.
-3. `API Gateway` —[gRPC: updateStatus]→ `TaskService`: Forwards transition query.
+2. `API Gateway` —[HTTP POST /internal/auth/validate]→ `UserService`: Validates requester roles and permissions.
+3. `API Gateway` —[HTTP POST /internal/tasks/:taskId/status]→ `TaskService`: Forwards transition query.
 4. `TaskService` —[SQL SELECT]→ `PostgreSQL DB`: Retrieves task entity details.
 5. `TaskService` —[State Machine Check]→ `TaskService`: Validates transition path using the State Pattern.
 6. `TaskService` —[SQL UPDATE]→ `PostgreSQL DB`: Updates state, increments version, and asserts version matches `expected_version`.
 7. `TaskService` —[SQL INSERT]→ `PostgreSQL DB`: Adds row to `task_status_history` table in the same transaction block.
 8. `TaskService` —[Kafka Event: TASK_UPDATED]→ `Notification Service`: Asynchronously emits state update notification.
 
-##### C. Infrastructure Topology
-* **Load Balancer:** L7 Round-robin load balancer.
-* **Rate Limiter:** Token bucket limiting bulk task assignment queries (limit: 30 requests/min per user).
-* **Blob Storage:** Attached task documents uploaded to S3, linked via document URI.
-* **Cache Layers:** Redis cache storing team task dashboard data with short TTLs.
+##### C. Tech Stack Summary
+```
+DB: PostgreSQL  [Why: optimistic locking via version column; relational JOIN for subtask hierarchy]
+Cache: Redis    [Why: team task dashboard data with short TTL invalidated on status changes]
+Queue: Kafka    [Why: decouple notifications from the write path; SLA alerting is non-critical]
+Read/Write: Mixed. Reads dominate (dashboard views). Writes are low-contention per task. Handled via optimistic locking to avoid holding DB connections.
+```
 
 ---
 
@@ -166,6 +168,33 @@ WHERE id = :task_id
 -- If rows updated == 0 -> throw VersionConflictException -> ROLLBACK
 ```
 
+##### D. Key Business Queries
+
+```sql
+-- 1. Active tasks for an assignee (cursor-paginated)
+SELECT id, title, status, priority, due_date
+FROM tasks
+WHERE assignee_id = :assignee_id AND id < :cursor_id
+  AND status NOT IN ('COMPLETED', 'CANCELLED')
+ORDER BY id DESC LIMIT 20;
+-- Index used: idx_tasks_assignee_status
+
+-- 2. SLA overdue tasks
+SELECT id, title, assignee_id, due_date
+FROM tasks
+WHERE due_date < NOW()
+  AND status NOT IN ('COMPLETED', 'CANCELLED')
+ORDER BY due_date ASC;
+-- Index used: idx_tasks_due_date_status
+
+-- 3. Task audit trail
+SELECT from_status, to_status, changed_by, reason, created_at
+FROM task_status_history
+WHERE task_id = :task_id
+ORDER BY created_at ASC;
+-- No dedicated index needed — task_id FK + small result set
+```
+
 ---
 
 #### 🏛️ LLD PART 2 — OOD CLASS DESIGN & DESIGN PATTERNS
@@ -184,14 +213,49 @@ TaskState (Interface)
   Methods: validateTransition(target: TaskStatus)
 ```
 
-##### B. Entity Relationships
+##### B. Dependency Injection Wiring Table
+
+| Class | Depends On (Interface) | Injected Impl |
+|---|---|---|
+| `TaskController` | `TaskService` | `TaskService` (Spring Bean) |
+| `TaskService` | `TaskRepository` | `JpaTaskRepository` |
+| `TaskService` | `TaskStateMachine` | `TaskStateMachine` (singleton) |
+| `TaskStateMachine` | `TaskState` | `CreatedState`, `AssignedState`, `InProgressState` |
+
+##### C. Formal Entity Relationships
 * **Realization:** `InProgressState` implements `TaskState`.
 * **Association:** `Task` maps **One-to-Many** to `TaskStatusHistory`.
 * **Aggregation:** `Task` holds an optional reference to a parent `Task` (hierarchy mapping).
 
-##### C. Applied Design Patterns
+##### D. State Transition Table
+
+| Current State | Trigger / Event | Next State | Guard Condition |
+|---|---|---|---|
+| `CREATED` | `assign()` | `ASSIGNED` | assignee_id must exist |
+| `ASSIGNED` | `start()` | `IN_PROGRESS` | requestor must be assignee |
+| `IN_PROGRESS` | `complete()` | `COMPLETED` | none |
+| `IN_PROGRESS` | `cancel()` | `CANCELLED` | only by creator or admin |
+| `ASSIGNED` | `cancel()` | `CANCELLED` | only by creator or admin |
+| `COMPLETED` | — | — | terminal state |
+| `CANCELLED` | — | — | terminal state |
+
+##### E. Applied Design Patterns
 * **State Pattern:** Encapsulates transition logic and guards into dedicated state classes, preventing messy conditional logic in services.
 * **Observer Pattern:** Decouples core task updates from async services (SMS, slack hooks) using event buses.
+
+##### F. SOLID Principles Checklist
+
+| Principle | How it shows in this design |
+|---|---|
+| S — Single Responsibility | TaskController handles HTTP mapping, TaskService owns business rules, TaskRepository owns data access, TaskStateMachine owns transition logic |
+| O — Open/Closed | TaskState interface — add new state class without modifying TaskStateMachine's core dispatch logic |
+| L — Liskov Substitution | Any TaskState impl (CreatedState, InProgressState) is substitutable without breaking TaskStateMachine callers |
+| I — Interface Segregation | TaskRepository only exposes findById, save, updateStatus — no irrelevant methods forced on callers |
+| D — Dependency Inversion | TaskService depends on TaskRepository interface, not JpaTaskRepository; swappable for in-memory test impl |
+
+##### G. Strict Coding Rules
+* Optimistic locking version conflict must throw a typed `VersionConflictException` — never swallow or wrap silently.
+* State transitions must always be driven through `TaskStateMachine` — direct `task.setStatus()` calls are forbidden outside the state machine.
 
 ---
 
@@ -233,3 +297,9 @@ com.slice.task
 
 * **Why is the State Pattern preferred over simple enums?**
   > *"When state logic grows (e.g. adding notifications, security validations, or automation triggers on transition), simple enum switch statements expand into unmaintainable spaghetti code. The State Pattern encapsulates this logic inside dedicated state classes, adhering to SRP."*
+
+* **Why relational DB over NoSQL for task management?**
+  > *"Task management needs JOIN semantics (task + history + subtasks in one query), referential integrity (subtask cannot reference non-existent parent), and optimistic locking via version columns. NoSQL databases handle these only with application-level workarounds. PostgreSQL gives us all three out of the box."*
+
+* **Walk me through the SOLID principles in your design.**
+  > *"Single Responsibility: each layer owns exactly one concern — Controller handles HTTP, Service owns business rules, Repository owns data access, StateMachine owns transition guards. Open/Closed: TaskState interface allows adding new states without modifying existing state classes or StateMachine dispatch logic. Liskov: every concrete state is a drop-in replacement — TaskStateMachine doesn't care which impl it gets. Interface Segregation: TaskRepository only exposes methods the service needs — no fat interface. Dependency Inversion: TaskService depends on TaskRepository interface, not JPA directly — swappable for in-memory mock in tests."*

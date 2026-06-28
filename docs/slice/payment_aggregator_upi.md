@@ -95,7 +95,7 @@ Response 401 Unauthorized:
 
 ##### B. Step-by-Step Service Communication Flow
 1. `Client` —[HTTPS POST /v1/payments/checkout]→ `API Gateway`: Submits purchase details and VPA.
-2. `API Gateway` —[gRPC: routeGateway]→ `CheckoutService`: Processes selection rules and saves initial `INITIATED` payment row to DB.
+2. `API Gateway` —[HTTP POST /internal/payments/checkout]→ `CheckoutService`: Processes selection rules and saves initial `INITIATED` payment row to DB.
 3. `CheckoutService` —[HTTPS POST: createOrder]→ `Aggregator API`: Registers checkout and receives internal platform reference ID.
 4. `CheckoutService` —[SQL UPDATE]→ `PostgreSQL DB`: Updates transaction status to `PENDING` with external reference.
 5. `Client App` —[UPI Intent / App Redirect]→ `UPI App`: Customer authorizes payment using personal PIN.
@@ -103,11 +103,13 @@ Response 401 Unauthorized:
 7. `CallbackService` —[SQL SELECT FOR UPDATE]→ `PostgreSQL DB`: Checks state limits and changes record status to `SUCCESS`.
 8. `CallbackService` —[Kafka Event: PAYMENT_SUCCESS]→ `Order/Ledger Service`: Asynchronously updates order systems.
 
-##### C. Infrastructure Topology
-* **Load Balancer:** Layer 7 (Application) LB using IP hashing for sticky customer routing if WebSocket polling is configured.
-* **Rate Limiter:** Token bucket limiting checkout requests (limit: 5 checkouts/min per card/account).
-* **Blob Storage:** Webhook raw payloads archived to S3 for debugging audits.
-* **Cache Layers:** Redis distributed lock tracking webhook dedup checks.
+##### C. Tech Stack Summary
+```
+DB: PostgreSQL  [Why: ACID state transitions for payment records; UNIQUE constraint on idempotency_key prevents double-processing]
+Cache: Redis    [Why: webhook deduplication locks (webhook:txn:{ext_id}); idempotency key fast-path checks]
+Queue: Kafka    [Why: decouple order/ledger updates from webhook processing — payment success triggers downstream services asynchronously]
+Read/Write: Write-heavy on webhook ingestion (each payment = multiple state transitions). Optimistic locking prevents concurrent webhooks overwriting terminal states.
+```
 
 ---
 
@@ -162,6 +164,31 @@ WHERE id = :id
   AND status = 'PENDING'; -- Prevents terminal state transitions
 ```
 
+##### D. Key Business Queries
+
+```sql
+-- 1. Payment history for an order (cursor-paginated)
+SELECT id, status, aggregator, external_transaction_id, created_at
+FROM payment_transactions
+WHERE order_id = :order_id AND id < :cursor_id
+ORDER BY id DESC LIMIT 20;
+-- Add index: idx_payment_transactions_order ON payment_transactions(order_id, id DESC)
+
+-- 2. Pending payments older than 10 minutes (reconciliation cron)
+SELECT id, order_id, aggregator, external_transaction_id, updated_at
+FROM payment_transactions
+WHERE status = 'PENDING'
+  AND updated_at < NOW() - INTERVAL '10 minutes';
+-- Index used: idx_payments_status_update ON payment_transactions(status, updated_at)
+
+-- 3. Payment event audit trail
+SELECT from_status, to_status, created_at
+FROM payment_events
+WHERE transaction_id = :transaction_id
+ORDER BY created_at ASC;
+-- Add index: idx_payment_events_txn ON payment_events(transaction_id)
+```
+
 ---
 
 #### 🏛️ LLD PART 2 — OOD CLASS DESIGN & DESIGN PATTERNS
@@ -181,16 +208,47 @@ PaymentOrchestrator (Service)
   Methods: checkout(req: CheckoutRequest): CheckoutResult
 ```
 
-##### B. Entity Relationships
+##### B. Dependency Injection Wiring Table
+
+| Class | Depends On (Interface) | Injected Impl |
+|---|---|---|
+| `CheckoutController` | `PaymentOrchestrator` | `PaymentOrchestrator` (Spring Bean) |
+| `WebhookController` | `CallbackService` | `CallbackService` (Spring Bean) |
+| `PaymentOrchestrator` | `PaymentRepository` | `JpaPaymentRepository` |
+| `PaymentOrchestrator` | `PaymentGateway` | `RazorpayGateway` / `CashfreeGateway` (via GatewayRegistry) |
+
+##### C. Formal Entity Relationships
 * **Realization:** `RazorpayGateway` and `CashfreeGateway` implement `PaymentGateway` interface.
 * **Association:** `PaymentTransaction` maps **One-to-Many** to `PaymentEvent` entries.
 * **Composition:** `PaymentOrchestrator` governs the processing workflow of `PaymentTransaction`.
 
-##### C. Applied Design Patterns
+##### D. State Transition Table
+
+| Current State | Trigger / Event | Next State | Guard Condition |
+|---|---|---|---|
+| `INITIATED` | `gatewayRegistered()` | `PENDING` | external_transaction_id received |
+| `PENDING` | `webhookCaptured()` | `SUCCESS` | HMAC signature valid |
+| `PENDING` | `webhookFailed()` | `FAILED` | HMAC signature valid |
+| `PENDING` | `pollerTimeout()` | `EXPIRED` | updated_at > 10 min ago |
+| `SUCCESS` | — | — | terminal state |
+| `FAILED` | — | — | terminal state |
+| `EXPIRED` | — | — | terminal state |
+
+##### E. Applied Design Patterns
 * **Strategy Pattern:** Used dynamically for choosing the best available aggregator via `PaymentGateway` implementations.
 * **State Pattern:** Governs state shifts: `INITIATED` -> `PENDING` -> `SUCCESS`/`FAILED`/`EXPIRED`. Terminal states reject transitions.
 
-##### D. Strict Coding Rules
+##### F. SOLID Principles Checklist
+
+| Principle | How it shows in this design |
+|---|---|
+| S — Single Responsibility | `PaymentOrchestrator` handles checkout flow; `CallbackService` handles webhook processing; `ReconcileService` handles stale payment polling |
+| O — Open/Closed | `PaymentGateway` interface — add `PhonePeGateway` without modifying `PaymentOrchestrator` routing logic |
+| L — Liskov Substitution | `RazorpayGateway` and `CashfreeGateway` are interchangeable `PaymentGateway` implementations |
+| I — Interface Segregation | `PaymentGateway` exposes only `createPayment` and `queryStatus` — no irrelevant methods |
+| D — Dependency Inversion | `PaymentOrchestrator` depends on `PaymentGateway` interface, not `RazorpayGateway` directly |
+
+##### G. Strict Coding Rules
 * Precision amounts utilizing `BigDecimal`.
 * Signature validations matching security codes utilize HMAC calculations.
 
@@ -234,3 +292,12 @@ com.slice.payment
 
 * **How do we secure webhook callbacks?**
   > *"Every webhook requires HMAC signature verification using a shared gateway secret. We compute the SHA256 signature from the raw payload body and reject updates if it doesn't match the signature provided in the headers."*
+
+* **Why cursor pagination over OFFSET?**
+  > *"OFFSET requires the DB to scan and discard N rows before returning results — for a merchant checking payment history page 50, that means discarding 1000 rows on every call. Cursor pagination (WHERE id < :cursor_id ORDER BY id DESC) uses the primary key index directly, giving O(log N) lookup regardless of page depth. At 100 TPS, payment history tables grow fast — cursor pagination keeps audit trail queries consistently fast."*
+
+* **Why relational DB over NoSQL for payment records?**
+  > *"Payments have two hard requirements NoSQL cannot satisfy safely. First, ACID state transitions: the optimistic locking UPDATE that moves `PENDING` to `SUCCESS` must be atomic — a partial write leaves the ledger inconsistent. Second, idempotency enforcement: the `UNIQUE` constraint on `idempotency_key` at the DB level is the last line of defense against double-charging. NoSQL databases typically enforce uniqueness at the application layer, which is vulnerable to race conditions. The audit trail JOIN between `payment_transactions` and `payment_events` is also a natural relational query."*
+
+* **Walk me through the SOLID principles in your design.**
+  > *"Single Responsibility: `PaymentOrchestrator` owns only the checkout flow — VPA validation, gateway selection, and initial DB write; `CallbackService` owns only webhook ingestion and state transition; `ReconcileService` owns only the background polling against aggregator status endpoints — three classes, three distinct jobs. Open/Closed: Adding `PhonePeGateway` means implementing the `PaymentGateway` interface and registering it in `GatewayRegistry` — `PaymentOrchestrator`'s routing logic is untouched. Liskov Substitution: `RazorpayGateway` and `CashfreeGateway` both satisfy `createPayment` and `queryStatus` contracts — `PaymentOrchestrator` can use either without conditional branching. Interface Segregation: `PaymentGateway` exposes only two methods — `createPayment` and `queryStatus`; reconciliation concerns like rate limits or circuit-breaker state are not leaked into this interface. Dependency Inversion: `PaymentOrchestrator` is constructed with a `PaymentGateway` reference injected by the framework — it has no compile-time dependency on `RazorpayGateway` or `CashfreeGateway`."*
