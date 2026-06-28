@@ -51,8 +51,6 @@ If you don't specify, I'll infer from the problem content.
 
 ---
 
----
-
 # ===============================================================
 # ROUND 1 — DSA PROTOCOL
 # ===============================================================
@@ -248,6 +246,19 @@ Key numbers to drop naturally:
 Trigger when: design a system at class/object level — Parking Lot, Elevator, Vending Machine, Ride Sharing, Auction, Task Manager, Cache, Notification System, Arithmetic Expression Tree, etc.
 
 **Amazon LLD round = 45 minutes. You will almost certainly NOT have a full running Spring Boot app with a live DB. The expectation is: clean OOD, clear class design, design patterns, and the ability to code key classes/methods clearly.**
+
+**Rough time budget per phase:**
+| Phase | Time | Notes |
+|---|---|---|
+| Phase 1 — Requirements + Clarifications | ~3 min | Don't rush this — shapes everything after |
+| Phase 2 — Entity design | ~7 min | Table + relationships |
+| Phase 3 — State machine (if applicable) | ~3 min | Skip if domain is stateless |
+| Phase 4 — Design patterns | ~3 min | Name + 1 sentence justification per pattern |
+| Phase 5 — Persistence (verbal unless asked for DDL) | ~3 min | Talk-track only unless pressed |
+| Phase 6 — Layer architecture (verbal) | ~3 min | Talk-track only unless pressed |
+| Phase 7 — Concurrency | ~3 min | Name the race condition, name the lock |
+| Phase 8 — Code (key chunks only) | ~15 min | Entity + service stubs for Mode A; full impl for Mode B |
+| Buffer / follow-ups / LP questions | ~5 min | Always comes |
 
 ---
 
@@ -574,8 +585,6 @@ Key talking points to weave in naturally:
 
 ---
 
----
-
 # ===============================================================
 # ROUND 3 — HM / BEHAVIORAL PROTOCOL
 # ===============================================================
@@ -633,9 +642,10 @@ E) Ownership / no one else did it?
    BACKUP 1: Walmart DB Purge (caught trend early, wasn't assigned)
 
 F) Disagreeing / pushing back?
-   Frame Outbox or Notification v2:
-   "Initial suggestion was [quick fix]. I raised [specific flaw]. Proposed [alternative].
-   Once team aligned, I committed fully and executed."
+   PRIMARY:  Walmart Kafka Outbox (Story E) — disagreed with retry-first, proposed Outbox,
+             committed fully once team aligned, owned implementation end-to-end.
+   BACKUP:   Dream11 Notification v2 — rejected fire-and-forget, proposed durable pipeline,
+             committed to delivery before cricket season despite tighter scope.
 ```
 
 ---
@@ -746,6 +756,31 @@ RESULT:
   Rapid Re-layer became standard pattern for event publishing in inventory domain.
 ```
 
+#### STORY E — Disagree and Commit: Walmart Kafka Outbox (Outbox vs Retry)
+```
+SITUATION: Inventory service intermittently losing Kafka messages. 5M+ messages/day.
+Team lead proposed adding retry logic — could ship in a day.
+
+TASK: I had identified the root cause as a dual-write atomicity gap, not a transient failure.
+
+ACTION (DISAGREE AND COMMIT lens):
+  I disagreed with the retry-first approach. Presented specific flaw:
+  "Retry assumes the message was produced but not acknowledged. It doesn't solve the case
+  where the JVM crashes between the DB write and the Kafka produce — the event is permanently
+  lost, not just delayed. A retry on a lost event will retry zero times."
+  Proposed the Outbox Pattern as the correct fix — same DB transaction writes to both
+  inventory table and outbox table, decoupling atomicity from the Kafka call.
+  Acknowledged the tradeoff: Outbox adds operational complexity (new component, new table).
+  Team aligned after seeing the failure mode diagram.
+  Once the decision was made: I owned the full implementation end-to-end.
+  No revisiting, no hedging — shipped Rapid Re-layer on schedule.
+
+RESULT:
+  Zero downstream incidents for inventory events since launch.
+  Rapid Re-layer became the standard pattern for event publishing in inventory domain.
+  The team's confidence in the approach grew — used it in 2 other services within 3 months.
+```
+
 #### STORY D — Walmart: DB Purge
 ```
 SITUATION: Inventory service: high volume, slow queries. Purge deletes ~150K records/run.
@@ -791,6 +826,9 @@ If probed on technical detail you haven't prepared:
 
 ### HM PHASE 6 — PROBLEM-SOLVING HYPOTHETICAL (If HM asks "How would you handle X?")
 
+**LP usually being probed:** Bias for Action (moving under uncertainty) or Dive Deep (finding root cause).
+**Anchor to a real story if possible** — after giving the framework, close with: "I faced something similar at [company] — [1-sentence tie-in to Story A/C/D]."
+
 Framework (state this structure out loud):
 1. Restate the problem (30 sec) — confirm understanding
 2. State assumptions — "I'll assume X since I don't have more context"
@@ -830,13 +868,13 @@ Case C — Gentle Push-back (Suggestion violates correctness):
 | Dream11 large club size | ~40,000 members |
 | CleverTap 429 at offset | 39,000 (resumed from there, 0 duplicates) |
 | Dream11 notification max latency | ~30 seconds (cron cycle) |
-| GraphQL optimization | 8-10 sequential calls → 2 parallel calls |
-| Dream11 Moderation concurrency | 3 concurrent LLM calls (semaphore) |
-| Dream11 Moderation skip conditions | 7 |
-| Walmart Kafka messages/day | 5M+ reliably delivered after Outbox fix |
-| Old programmatic purge | ~150K records/run |
-| Purge improvement | Deletion rate exceeded creation rate |
-| Dream11 Guru Teams peak | 2.5M RPM, 120K picks/team/round |
+| GraphQL optimization | 8-10 sequential calls → 2 parallel calls (Dream11 feed latency fix — no backing STAR story; use only as a supporting detail if asked about performance optimization) |
+| Dream11 Moderation concurrency | 3 concurrent LLM calls (semaphore) (content moderation pipeline — no backing STAR story; mention only if asked about async/concurrency design) |
+| Dream11 Moderation skip conditions | 7 (same context as above) |
+| Walmart Kafka messages/day | 5M+ reliably delivered after Outbox fix (Story C + Story E) |
+| Old programmatic purge | ~150K records/run (Story D) |
+| Purge improvement | Deletion rate exceeded creation rate (Story D) |
+| Dream11 Guru Teams peak | 2.5M RPM, 120K picks/team/round (no backing STAR story; use only as a scale signal if asked about high-throughput systems) |
 
 ---
 
@@ -848,12 +886,12 @@ Case C — Gentle Push-back (Suggestion violates correctness):
 > "Let me fully understand the problem before I start coding.
   [Restate in own words]. Quick clarifications: [2 questions].
   My first instinct is this looks like a [pattern] problem.
-  Let me walk through a brute force approach first, then optimize."
+  Let me assess whether there's a meaningful brute-force stepping stone, or if I should go directly to the optimal approach."
 
 ## LLD — Opening 2 minutes
 > "Before I start designing, let me identify the core entities and clarify a few things —
   helps me avoid reworking mid-way. [Ask 3-4 questions]. Great.
-  Let me start with the entities, then relationships, patterns, DB schema, and APIs."
+  Let me start with the entities, then relationships, patterns — and we can go into persistence and API design if time allows."
 
 ## HM — Opening 10 seconds
 > "Great question. Let me think of the best example from my experience.
@@ -862,4 +900,4 @@ Case C — Gentle Push-back (Suggestion violates correctness):
 
 ---
 
-*Last updated: 2026-06-27 | Jinay Parekh | Amazon SDE 2 (L5) Interview Loop*
+*Last updated: 2026-06-28 | Jinay Parekh | Amazon SDE 2 (L5) Interview Loop*
