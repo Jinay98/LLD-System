@@ -68,56 +68,77 @@ Example: *"Do we allow negative wallet balances, or must it fail immediately at 
 *No back-of-the-envelope capacity planning needed. State assumptions that drive design decisions: consistency model, currency, failure tolerance.*
 Example: *"Strict ACID consistency for balances. Currency in INR stored as paise (BIGINT). Single-region for now. Idempotency required on all write APIs."*
 
-**C. CORE API CONTRACTS**
+**C. CORE API CONTRACTS** *(Generate 4-6 endpoints covering ALL major user flows — not just the happy-path write. Every endpoint must include the idempotency header on write operations, a 2xx success, and the key error codes.)*
+
+**Rule:** If an endpoint has cursor-based pagination, show the cursor parameter. If a write endpoint needs an idempotency key, include it. Keep request/response bodies tight — only the fields that matter for design.
+
+Endpoints to cover (adapt names to the domain):
+1. **Primary write** — the main operation (transfer, book seat, create task, etc.)
+2. **Secondary write** — second major mutation (add money/top-up, cancel, approve, etc.)
+3. **Read: single entity** — fetch one resource by ID (wallet balance, task detail, booking status)
+4. **Read: list / history** — paginated list with cursor param (transaction history, task list, etc.)
+5. **Status/health check** (optional, include if the domain has a status polling pattern)
+6. **Admin/reconciliation** (optional, include if the domain has an audit or correction flow)
+
+Example (wallet system — use as format reference, not as a copy-paste):
 ```http
-POST /v1/wallets/transfer
+# 1. Transfer (primary write)
+POST /v1/wallets/transfers
 Headers: X-Idempotency-Key: UUID, Authorization: Bearer token
-Request JSON:
-{
-  "sender_id": 12345,
-  "receiver_id": 67890,
-  "amount_in_paise": 50000
-}
-Response 201 Created:
-{
-  "transaction_id": "tx_998877",
-  "status": "SUCCESS",
-  "timestamp": "2026-06-26T19:10:50Z"
-}
-Response 409 Conflict: { "error": "Duplicate request processed" }
-Response 422 Unprocessable Entity: { "error": "Insufficient funds" }
+Request: { "sender_wallet_id": 987654, "receiver_wallet_id": 123456, "amount_in_paise": 150000 }
+Response 201: { "transaction_id": "txn_88776655", "status": "SUCCESS", "created_at": "..." }
+Response 409: { "error": "DUPLICATE_REQUEST" }
+Response 422: { "error": "INSUFFICIENT_FUNDS" }
+
+# 2. Top-up / Add money (secondary write)
+POST /v1/wallets/{walletId}/topup
+Headers: X-Idempotency-Key: UUID, Authorization: Bearer token
+Request: { "amount_in_paise": 50000, "payment_reference": "upi_ref_xyz" }
+Response 200: { "wallet_id": 987654, "new_balance_in_paise": 500000 }
+Response 422: { "error": "INVALID_AMOUNT" }
+
+# 3. Get balance (read: single entity)
+GET /v1/wallets/{walletId}/balance
+Headers: Authorization: Bearer token
+Response 200: { "wallet_id": 987654, "balance_in_paise": 450050, "currency": "INR", "updated_at": "..." }
+Response 404: { "error": "WALLET_NOT_FOUND" }
+
+# 4. Transaction history (read: paginated list)
+GET /v1/wallets/{walletId}/transactions?cursor=<last_txn_id>&limit=20
+Headers: Authorization: Bearer token
+Response 200: { "transactions": [...], "next_cursor": "txn_88776600", "has_more": true }
+
+# 5. Get transaction detail (read: single)
+GET /v1/wallets/transactions/{transactionId}
+Response 200: { "transaction_id": "txn_88776655", "sender_wallet_id": ..., "receiver_wallet_id": ..., "amount_in_paise": ..., "status": "SUCCESS" }
 ```
+
+**D. ⚡ PROBLEM HARDNESS RADAR** *(Generate this immediately alongside A-C — 3 bullets max, each instantly speakable)*
+
+**Rule:** This is NOT a lengthy analysis. Output exactly 3 bullets in the format below. Each bullet is one sentence I can say out loud RIGHT NOW to signal to the interviewer that I see the hard parts. A fast 75-80% correct answer here beats a slow perfect one.
+
+Format:
+```
+• [Hardest Challenge #1 name] → [Chosen strategy in one line — no elaboration]
+• [Hardest Challenge #2 name] → [Chosen strategy in one line]
+• [Hardest Challenge #3 name] → [Chosen strategy in one line]
+```
+
+Example (for a wallet system):
+```
+• Concurrent balance debit (two transfers hitting the same wallet) → Pessimistic row-lock (SELECT FOR UPDATE) in sorted wallet-ID order to prevent deadlock.
+• Idempotency (duplicate retries crediting/debiting twice) → idempotency_records table with PROCESSING → SUCCESS state machine + unique key constraint.
+• Ledger consistency (balance column drifting from ledger sum) → Double-entry bookkeeping: every transfer = 2 atomic ledger inserts inside one transaction; nightly reconciliation job flags drift.
+```
+
+Verbal script to say after reading these 3 bullets aloud:
+> "These three are where I'll focus the most design attention — let me walk through the schema and class design with those in mind."
 
 ---
 
 ### ▶ PHASE 2 — FULL DESIGN
 
-#### 🏗️ HLD & SERVICE FLOWS
-
-**A. Core Microservice Boundaries** *(List 3-4 services, their databases, and sync/async boundaries)*
-
-**B. Step-by-Step Service Communication Flow** *(Point-based protocol and action flow for the main user journey)*
-Format: `[Step #] [Source] -[Protocol: Verb/Event]-> [Destination]: [Description of action]`
-Default protocol is **REST/HTTP** for all synchronous service calls. Use Kafka/async events for non-critical or decoupled flows.
-Example:
-1. `Client` —[HTTPS POST /v1/transfers]→ `API Gateway`: Initiates transaction request with JWT and Idempotency key.
-2. `API Gateway` —[HTTP POST /internal/auth/validate]→ `Auth Service`: Validates JWT and checks user profile is active.
-3. `Wallet Service` —[SQL SELECT FOR UPDATE]→ `PostgreSQL DB`: Locks sender and receiver balance rows.
-
-**C. Tech Stack Summary (Generated at the end of HLD — keep it brief)**
-**Interview guide says: avoid in-depth service internals, protocols, and capacity planning. One line per choice with a Why tag.**
-- **DB:** Relational or NoSQL. `[Why: ACID/JOIN needs vs. write-scale trade-off]`
-- **Cache (if applicable):** What is cached and TTL. `[Why: avoids DB hit on hot-path reads]`
-- **Queue (if applicable):** What events flow async and why they're decoupled. `[Why: non-critical path, retry tolerance]`
-- **Read/write pattern:** Read-heavy or write-heavy — and one sentence on how the design handles it.
-
-Example:
-```
-DB: PostgreSQL  [Why: ACID transactions for ledger; JOIN for wallet ↔ entries reconciliation]
-Cache: Redis    [Why: balance reads on hot path; avoids lock contention on SELECT]
-Queue: Kafka    [Why: decouple audit/notification from critical write path; durable, replayable]
-Read/Write: Write-heavy (every transaction = 2 ledger entries). Handled via connection pooling + pessimistic row-lock scope minimized to balance update only.
-```
+**⚠️ OUTPUT ORDER RULE: Always generate LLD PARTS 1–4 first. HLD & SERVICE FLOWS comes LAST. Reason: Slice weights LLD at 70% — go deep on schema and class design before touching infrastructure. The interviewer will ask "walk me through your data model" before "describe your services". If you're running short on time, LLD depth > HLD breadth.**
 
 ---
 
@@ -205,19 +226,66 @@ Define partition key, clustering/sort key, and mapping access patterns.
 #### 🏛️ LLD PART 2 — OOD CLASS DESIGN & DESIGN PATTERNS
 
 **A. Core Class Specifications**
-For each class, list: layer type, attributes (with types), key methods (with full signatures), and which interface it implements.
+For each class, list: layer type, attributes (with types), key methods (with full signatures, thread-safety note, and locking strategy), and which interface it implements.
+
+**Thread-safety annotation rules — add these to every service method signature:**
+- `[THREAD-SAFE: pessimistic DB lock]` — method acquires SELECT FOR UPDATE inside @Transactional
+- `[THREAD-SAFE: optimistic lock, throws OptimisticLockException on conflict]` — uses @Version field
+- `[NOT thread-safe: caller must serialize]` — for in-memory-only or single-threaded contexts
+- `[THREAD-SAFE: idempotency guard]` — unique constraint prevents duplicate execution
+
+For each **entity** class, note which fields are mutable post-creation and which are immutable (final).
+For each **service** method, note the @Transactional boundary and isolation level if non-default.
+
+Format:
 ```
-WalletRepository (Interface)
-  Methods: findByIdForUpdate(id: Long): Optional<Wallet>
-           save(wallet: Wallet): Wallet
+[ClassName] ([Layer: Entity | Repository Interface | Service | Controller | Strategy])
+  Attributes:
+    - fieldName: Type  [immutable | mutable — who can change it]
+  Key Methods:
+    - methodName(params): ReturnType
+        [THREAD-SAFE annotation]
+        [@Transactional: yes/no — isolation: READ_COMMITTED/SERIALIZABLE]
+        [Why this method exists: 1 sentence]
+  Implements: InterfaceName (or "Nothing — concrete class")
+```
 
-JpaWalletRepository (Implementation of WalletRepository)
-  → satisfies Dependency Inversion Principle
+Example (wallet domain):
+```
+Wallet (Entity)
+  Attributes:
+    - id: Long          [immutable — set at creation]
+    - userId: Long      [immutable — never changes after creation]
+    - balance: BigDecimal  [mutable — only WalletService.transfer() may change this]
+    - version: Integer  [mutable — incremented by DB on each update for optimistic lock]
+  Key Methods:
+    - debit(amount: BigDecimal): void
+        [Guard: throws InsufficientFundsException if balance < amount]
+        [Why: encapsulates balance mutation — no external code touches balance directly]
+    - credit(amount: BigDecimal): void
+        [Guard: throws IllegalArgumentException if amount <= 0]
 
-WalletService (Service)
-  Implements: Nothing (concrete service)
+WalletRepository (Interface — Repository Layer)
+  Methods:
+    - findByIdForUpdate(id: Long): Optional<Wallet>
+        [Maps to: SELECT * FROM wallets WHERE id = ? FOR UPDATE]
+        [Why: acquires pessimistic row-lock before balance update]
+    - save(wallet: Wallet): Wallet
+    - findById(id: Long): Optional<Wallet>  [read-only, no lock]
+
+WalletService (Service Layer)
   Attributes: walletRepo: WalletRepository, limitValidator: LimitValidator, idempotencyRepo: IdempotencyRepository
-  Key Methods: transfer(senderId: long, receiverId: long, amount: BigDecimal, idempotencyKey: String): TransactionResult
+  Key Methods:
+    - transfer(senderId: long, receiverId: long, amount: BigDecimal, idempotencyKey: String): TransactionResult
+        [THREAD-SAFE: pessimistic DB lock on both wallet rows, sorted by ID to prevent deadlock]
+        [@Transactional: yes — isolation: READ_COMMITTED]
+        [Why READ_COMMITTED not SERIALIZABLE: full serializable is too expensive; FOR UPDATE gives us the row-level guarantee we need]
+        Steps inside:
+          1. Idempotency check — query idempotencyRepo; return cached result if already SUCCESS
+          2. Lock both wallets: LEAST(senderId, receiverId) first, GREATEST second — prevents deadlock
+          3. Validate: sender.balance >= amount via wallet.debit() guard
+          4. Apply: wallet.debit() + wallet.credit() + 2 ledger inserts — all in one @Transactional boundary
+          5. Publish TXN_COMMITTED to Kafka outbox table (same transaction — not a separate Kafka call)
 ```
 
 **B. Dependency Injection Wiring Table**
@@ -290,6 +358,51 @@ com.slice.wallet
 
 ---
 
+#### 🏗️ HLD & SERVICE FLOWS *(Intentionally placed LAST — cover LLD depth first)*
+
+**A. Core Microservice Boundaries** *(List 3-4 services, their databases, and sync/async boundaries)*
+
+**B. Step-by-Step Service Communication Flow**
+
+Format rule: **Every step must have 3 parts:** `[SYNC/ASYNC]` label, the protocol+action, and a `[Why: ...]` tag explaining why this call exists and why it's sync or async.
+
+```
+[Step #] [SYNC|ASYNC] Source —[Protocol: Verb/Event]→ Destination: Description of action
+[Why: one sentence explaining why this step is here and why sync/async]
+```
+
+Example:
+```
+1. [SYNC] Client —[HTTPS POST /v1/wallets/transfers]→ API Gateway: Submits transfer request with JWT and Idempotency-Key.
+   [Why: SYNC — client needs immediate confirmation; gateway is the single entry point for auth + routing.]
+
+2. [SYNC] API Gateway —[HTTP POST /internal/auth/validate]→ Auth Service: Validates JWT, checks user is active.
+   [Why: SYNC — must block if auth fails; proceeding without valid identity is a security hole.]
+
+3. [SYNC] WalletService —[SQL SELECT FOR UPDATE]→ PostgreSQL: Locks sender and receiver rows in ID order.
+   [Why: SYNC + pessimistic lock — balance check and update must be atomic; concurrent debits without a lock cause double-spend.]
+
+4. [SYNC] WalletService —[SQL INSERT × 4]→ PostgreSQL: Inserts 2 ledger entries + updates 2 wallet balances in one transaction.
+   [Why: SYNC — all four writes must succeed or all must roll back; split writes = ledger inconsistency.]
+
+5. [ASYNC] WalletService —[Kafka: TXN_COMMITTED]→ Notification Service: Publishes event after commit.
+   [Why: ASYNC — notifications are non-critical; decoupling prevents CleverTap/SMS latency from blocking the transfer response.]
+```
+
+**Runtime challenge: "Why not validate auth inside WalletService instead of at the gateway?"**
+> *"Separation of concerns — the gateway is the single choke point for cross-cutting concerns like auth, rate limiting, and routing. If each service validates its own JWT, any misconfiguration in one service becomes a security gap. Centralizing at the gateway means one place to rotate keys, one place to enforce policies."*
+
+**Runtime challenge: "Why call LimitService synchronously instead of async?"**
+> *"Limits are a pre-condition for the transfer — if I publish async, I've already locked rows and debited the account before knowing if the limit is breached. That means I'd need a compensating transaction to reverse it, which is far more complex than a synchronous reject before touching any balance."*
+
+**C. Tech Stack Summary (keep brief — one line per choice with Why tag)**
+- **DB:** PostgreSQL `[Why: ACID for ledger; JOIN for wallet ↔ entries reconciliation]`
+- **Cache:** Redis — balance read cache, TTL 30s `[Why: hot-path reads; avoids lock contention on SELECT]`
+- **Queue:** Kafka — async events only `[Why: decouple notifications/audit from critical write path; durable, replayable]`
+- **Read/Write:** Write-heavy. Handled via connection pooling + pessimistic lock scope minimized to balance row only.
+
+---
+
 #### 🤝 ADAPTIVE BEHAVIOR & COLLABORATION RULES
 When the interviewer suggests an alternative, points out a potential bottleneck, or modifies a requirement, follow this structured response template. Do not be rigid or defend choices blindly:
 
@@ -306,7 +419,8 @@ When the interviewer suggests an alternative, points out a potential bottleneck,
 ---
 
 #### 💬 REVISION & CHALLENGE CARDS
-Prepare bullet-proof verbal justifications for each of these. Write the full verbal answer, not just a bullet.
+
+**Rule for the model:** For EVERY non-obvious design decision in the output, include a brief `[Why: ...]` inline tag so Jinay can immediately justify it if questioned during the live interview. These challenge cards are for common probes — but the inline Why tags cover one-off questions.
 
 - **"Why not float for money?"**
   > *"Floating-point (IEEE 754) represents decimals via binary approximation. Adding fractions compounds rounding errors — 0.1 + 0.2 = 0.30000000000000004. At millions of transactions this causes ledger drift. We store balances as BIGINT in paise to make all arithmetic exact integers. If decimals are needed for display, we use DECIMAL(15,2) — never FLOAT or DOUBLE."*
@@ -322,6 +436,21 @@ Prepare bullet-proof verbal justifications for each of these. Write the full ver
 
 - **"Walk me through the SOLID principles in your design."**
   > *"Single Responsibility: each layer owns exactly one concern — Controller handles HTTP, Service owns business rules, Repository owns data access. Open/Closed: I use Strategy for anything that varies — payment methods, limit rules — so I add new behaviour without modifying existing classes. Liskov: every concrete strategy is a drop-in replacement for its interface. Interface Segregation: my repository interface exposes only the methods the service actually calls — no fat interface. Dependency Inversion: the Service depends on the WalletRepository interface, not JPA directly — the concrete implementation is injected, so I can swap it in tests or swap the DB layer without touching business logic."*
+
+- **"Why lock wallets in LEAST/GREATEST ID order?"**
+  > *"Classic deadlock prevention. If Thread A locks wallet 1 then wallet 2, and Thread B locks wallet 2 then wallet 1, they can deadlock waiting on each other. By always locking the lower ID first, both threads acquire locks in the same order — one blocks waiting for the other to release instead of deadlocking. This is a standard DB deadlock prevention technique for multi-row transactions."*
+
+- **"Why is the balance column a cache? Shouldn't ledger sum be the source of truth?"**
+  > *"The ledger IS the source of truth — it's append-only and never modified. The balance column is a materialized cache: it's updated atomically in the same transaction as the ledger entries, so it stays consistent. We keep it because summing all ledger entries for every balance-check query is O(n) and would get expensive on a high-traffic account. The nightly reconciliation job catches any drift if the cache ever desyncs."*
+
+- **"Why an idempotency table instead of just a unique constraint on the business table?"**
+  > *"A unique constraint on the transaction table catches duplicates after we've already started processing. The idempotency table lets us detect duplicates at the entry point — before we acquire any locks or touch any balances. It also lets us cache and return the original response payload to the retrying client, which a simple unique constraint can't do."*
+
+- **"Why HLD last and LLD first in your design walk-through?"**
+  > *"Because Slice's interview guide weights LLD at 70%. Spending the first 30 minutes on microservice boxes and arrows means I only have 15 minutes for schema and class design — which is exactly where the bar is set. The infrastructure is simpler to infer from the data model than the reverse. If I know my entities and locking strategy, the service boundaries are obvious."*
+
+- **"Why READ_COMMITTED isolation instead of SERIALIZABLE?"**
+  > *"SERIALIZABLE prevents all phantom reads and write skew but blocks or aborts concurrent transactions that touch overlapping rows. For a transfer service under load, that means far more rollbacks and retries. We avoid the need for SERIALIZABLE by using SELECT FOR UPDATE — that gives us the row-level write ordering guarantee we care about without paying the full cost of snapshot isolation across the entire transaction graph."*
 
 ---
 

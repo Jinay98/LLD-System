@@ -256,8 +256,8 @@ Trigger when: design a system at class/object level — Parking Lot, Elevator, V
 | Phase 4 — Design patterns | ~3 min | Name + 1 sentence justification per pattern |
 | Phase 5 — Persistence (verbal unless asked for DDL) | ~3 min | Talk-track only unless pressed |
 | Phase 6 — Layer architecture (verbal) | ~3 min | Talk-track only unless pressed |
-| Phase 7 — Concurrency | ~3 min | Name the race condition, name the lock |
-| Phase 8 — Code (key chunks only) | ~15 min | Entity + service stubs for Mode A; full impl for Mode B |
+| **Phase 7 — Code (key chunks only)** | ~15 min | Entity + service stubs for Mode A; full impl for Mode B |
+| **Phase 8 — Concurrency** | ~3 min | Name the race condition BEFORE writing code — then the code naturally guards it |
 | Buffer / follow-ups / LP questions | ~5 min | Always comes |
 
 ---
@@ -306,6 +306,27 @@ Verbal opening I can say:
 **B. FUNCTIONAL REQUIREMENTS** (5-6 bullets)
 **C. NON-FUNCTIONAL REQUIREMENTS** (3 bullets: concurrency, consistency, extensibility)
 **D. OUT OF SCOPE** (2-3 explicit deferrals)
+
+**E. ⚡ PROBLEM HARDNESS RADAR** *(Generate alongside A-D — 3 bullets max, each instantly speakable)*
+
+**Rule:** This is NOT a lengthy analysis. Output exactly 3 bullets immediately — one sentence each. These are the hardest design challenges in this domain and the one-line chosen strategy. I say these aloud to the interviewer as soon as I see them. A fast 75-80% correct answer beats a slow perfect one — working solution wins.
+
+Format:
+```
+• [Hardest Challenge #1 name] → [Chosen strategy — 1 line, no elaboration]
+• [Hardest Challenge #2 name] → [Chosen strategy — 1 line]
+• [Hardest Challenge #3 name] → [Chosen strategy — 1 line]
+```
+
+Example (Parking Lot):
+```
+• Concurrent slot assignment (two cars racing for last spot) → Pessimistic lock on slot row (SELECT FOR UPDATE) inside transaction before any status check.
+• State machine enforcement (slot moving to invalid state) → Guard method on Slot entity throws IllegalStateException on bad transition; never update status directly.
+• Double payment / idempotency (retry charges twice) → Unique constraint on idempotency_key in payments table; check before creating new charge.
+```
+
+Verbal script to say after reading these aloud:
+> "Let me call out the three hardest parts first — [read bullets]. I'll make sure the design handles each one explicitly. Let me now walk through the entities."
 
 ---
 
@@ -410,47 +431,39 @@ Response 422: { "error": "[Business rule violation]" }
 
 ---
 
-### LLD PHASE 7 — CONCURRENCY & LOCKING STRATEGY
-
-**Race conditions in this system:** [List specific scenarios]
-
-| Scenario | Strategy | Implementation |
-|---|---|---|
-| High-conflict shared resource | Pessimistic Write Lock | `SELECT * FROM [t] WHERE id = ? FOR UPDATE` |
-| Low-conflict, retry-tolerant | Optimistic Lock | `UPDATE ... SET version=version+1 WHERE id=? AND version=?` |
-| Idempotency check | Unique constraint | Unique index on idempotency_key column |
-
-Java annotations:
-- Pessimistic: `@Lock(LockModeType.PESSIMISTIC_WRITE)` on repository method
-- Optimistic: `@Version` on entity field
-
----
-
-### LLD PHASE 8 — JAVA CODE (Adaptive by mode)
+### LLD PHASE 7 — JAVA CODE (Adaptive by mode)
 
 **For MODE A (OOD / Conceptual): Write entity classes + service method stubs. Explain each chunk before writing it. Do NOT write full Spring Boot controllers.**
 
 **For MODE B (Standalone implementation): Write fully working code in chunks, same as DSA Phase 5 chunking rules.**
 
+**⚠️ INLINE [Why] RULE — APPLIES TO ALL CODE CHUNKS:**
+For every non-obvious line or design choice in the code output, add a `// Why: ...` inline comment.
+These are the interviewer's most common probes: "why did you use X?", "why not Y?", "what happens if Z?"
+A one-liner comment means Jinay can immediately justify the decision out loud without having to think.
+
 ---
 
-**MODE A skeleton (most common):**
+**MODE A skeleton (most common) — with real concurrency guards:**
 
 ```java
 // === CHUNK 1: ENUMS & CORE ENTITY ===
-// What: Define the lifecycle states and the primary entity with its guard logic.
+// What: Define lifecycle states + entity with guard methods that enforce valid transitions.
+// Say aloud: "I'll define the entity first with state guards built in — no caller can put it in an invalid state."
 
 public enum [StatusEnum] { CREATED, IN_PROGRESS, DONE, CANCELLED }
 
 public class [EntityName] {
-    private final Long id;                 // immutable after creation
+    private final Long id;                  // Why: immutable — ID never changes after creation
     private [StatusEnum] status;
-    private BigDecimal price;              // BigDecimal — never double
+    private BigDecimal [monetaryField];     // Why: BigDecimal, never double — exact decimal arithmetic
 
+    // Guard method — entity owns its own state transition logic
     public void [transitionMethod]() {
         if (this.status != [StatusEnum].EXPECTED_STATE) {
             throw new IllegalStateException(
                 "Cannot [trigger] from state: " + this.status
+                // Why: fail-fast here instead of letting the wrong state silently propagate
             );
         }
         this.status = [StatusEnum].NEXT_STATE;
@@ -459,32 +472,73 @@ public class [EntityName] {
 
 // === CHUNK 2: REPOSITORY INTERFACE (Dependency Inversion) ===
 // What: Service depends on this abstraction — never on a concrete JPA class.
+// Say aloud: "I depend on the interface so I can swap implementations and mock in tests."
 
 public interface [EntityName]Repository {
     Optional<[EntityName]> findById(Long id);
     [EntityName] save([EntityName] entity);
-    // For high-conflict writes: findByIdWithLock(Long id) — maps to SELECT FOR UPDATE
+
+    // Pessimistic lock variant — maps to SELECT ... FOR UPDATE
+    // Why: needed for high-contention resources; regular findById has no lock guarantee
+    [EntityName] findByIdWithLock(Long id);
 }
 
-// === CHUNK 3: SERVICE (Business logic lives here) ===
-// What: All business rules, state transitions, idempotency — @Transactional boundary.
+// === CHUNK 3: SERVICE — Concurrency-Safe Core Method ===
+// What: All business rules, idempotency, state transitions, and locking strategy live here.
+// @Transactional boundary is here — everything inside is atomic.
+// Say aloud: "Let me walk through the service method step by step — this is where all the concurrency decisions show up."
 
 public class [EntityName]Service {
-    private final [EntityName]Repository repo;    // injected via constructor (DIP)
-    private final [StrategyInterface] strategy;   // swappable via Strategy pattern
+    private final [EntityName]Repository repo;    // Why: interface — DIP; service doesn't know about JPA
+    private final [StrategyInterface] strategy;   // Why: Strategy pattern — swap algorithm without if-else
+    private final IdempotencyRepository idempotencyRepo;
 
-    public [EntityName]Service([EntityName]Repository repo, [StrategyInterface] strategy) {
+    // Constructor injection — Why: makes dependencies explicit and testable; no hidden Spring magic
+    public [EntityName]Service(
+            [EntityName]Repository repo,
+            [StrategyInterface] strategy,
+            IdempotencyRepository idempotencyRepo) {
         this.repo = repo;
         this.strategy = strategy;
+        this.idempotencyRepo = idempotencyRepo;
     }
 
-    public [ReturnType] [coreMethod]([params]) {
-        // Step 1: Idempotency check (unique constraint or Redis check)
-        // Step 2: Load entity, validate state precondition
-        // Step 3: Apply business logic / strategy
-        // Step 4: Transition state (entity.transitionMethod())
-        // Step 5: Persist via repo.save()
-        // Step 6: If async consumers exist → write to Outbox table in same transaction
+    @Transactional  // Why: all steps below must commit together or roll back together
+    public [ReturnType] [coreMethod](String idempotencyKey, [params]) {
+
+        // --- STEP 1: IDEMPOTENCY GUARD ---
+        // Why: checked first, before any lock is acquired — cheap exit for duplicate requests
+        Optional<IdempotencyRecord> existing = idempotencyRepo.findByKey(idempotencyKey);
+        if (existing.isPresent() && existing.get().getStatus() == IdempotencyStatus.SUCCESS) {
+            return existing.get().getCachedResult();  // return original response, no double processing
+        }
+        // Mark PROCESSING — Why: concurrent duplicate will see PROCESSING and return 202, not process again
+        idempotencyRepo.save(new IdempotencyRecord(idempotencyKey, IdempotencyStatus.PROCESSING));
+
+        // --- STEP 2: ACQUIRE LOCK (Pessimistic — for high-contention resources) ---
+        // Why: load with lock before reading state — prevents TOCTOU race (read-check-then-act on stale data)
+        [EntityName] entity = repo.findByIdWithLock(entityId)
+            .orElseThrow(() -> new ResourceNotFoundException("[EntityName] not found: " + entityId));
+        // Alternative if low-contention: use @Version optimistic lock — throws OptimisticLockException on conflict
+
+        // --- STEP 3: VALIDATE STATE PRECONDITION ---
+        // Why: guard inside entity throws IllegalStateException on invalid transition — no if-else in service
+        entity.[transitionMethod]();
+
+        // --- STEP 4: APPLY BUSINESS LOGIC ---
+        strategy.apply(entity, [params]);  // Why: Strategy — behaviour varies, but service doesn't change
+
+        // --- STEP 5: PERSIST ---
+        [EntityName] saved = repo.save(entity);
+
+        // --- STEP 6: OUTBOX (if async consumers exist) ---
+        // Why: write event to Outbox table in SAME transaction — not a separate Kafka.send() call
+        // Guarantees: if DB commits, event is guaranteed to be published; no dual-write gap
+        // outboxRepo.save(new OutboxEvent("[ENTITY]_[EVENT]", saved.getId()));
+
+        // Mark SUCCESS on idempotency record
+        idempotencyRepo.markSuccess(idempotencyKey, saved);
+        return [ReturnType].from(saved);
     }
 }
 ```
@@ -502,6 +556,24 @@ Output as numbered chunks. Each chunk = one logical component. Include full work
 // What this does: [1 sentence]
 [fully working code]
 ```
+
+---
+
+### LLD PHASE 8 — CONCURRENCY & LOCKING STRATEGY *(Named after code — interviewer often asks "how does your code handle concurrent X?" — this is your answer block)*
+
+**Race conditions in this system:** [List specific scenarios from the domain]
+
+| Scenario | Strategy | Implementation | Runtime justification |
+|---|---|---|---|
+| High-conflict shared resource | Pessimistic Write Lock | `SELECT * FROM [t] WHERE id = ? FOR UPDATE` | "Optimistic would create a retry thundering herd under load — pessimistic serializes safely" |
+| Low-conflict, retry-tolerant | Optimistic Lock | `UPDATE ... SET version=version+1 WHERE id=? AND version=?` | "Under low contention, optimistic avoids lock overhead — conflict rate is near zero" |
+| Duplicate request / retry | Idempotency guard | Unique constraint on idempotency_key + PROCESSING state | "Unique constraint is atomic — only one thread wins the insert, others return 409" |
+| Multi-row deadlock risk | Lock ordering | Always acquire locks in ascending entity ID order | "If A locks 1→2 and B locks 2→1, deadlock. Fixed by always locking lower ID first" |
+
+Java annotations (say these aloud if interviewer asks about implementation):
+- Pessimistic: `@Lock(LockModeType.PESSIMISTIC_WRITE)` on repository method
+- Optimistic: `@Version` on entity field — Spring throws `OptimisticLockingFailureException` on conflict
+- Transactional boundary: `@Transactional` on service method — NOT on repository, NOT on controller
 
 ---
 
