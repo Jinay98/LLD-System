@@ -658,12 +658,26 @@ Key talking points to weave in naturally:
 ---
 
 # ===============================================================
-# ROUND 3 — HM / BEHAVIORAL PROTOCOL
+# ROUND 3 — HM + HLD COMBINED ROUND PROTOCOL
 # ===============================================================
 
-## 👤 HM ROUND — WHEN TO TRIGGER
+## 👤 HM + HLD ROUND — WHAT TO EXPECT
 
-Trigger when: "Tell me about a time when..." / "Give me an example of..." / "Describe a situation where..."
+**This is a single round that mixes two types of questions:**
+1. **Behavioral / LP questions** — "Tell me about a time..." → primary LP probed is **Earn Trust**
+2. **Resume deep-dive** — "Walk me through how you built X" → implementation details of your Dream11/Walmart systems
+3. **HLD concepts** — "Why did you choose Kafka over SQS?" / "How does Redis handle eviction?" → grilling on any tech component you mentioned
+
+**Primary LP: Earn Trust**
+> "Leaders listen attentively, speak candidly, and treat others respectfully. They are vocally self-critical, even when it's embarrassing. They do not believe their or their team's body odor smells of perfume. Leaders have conviction and are tenacious. They do not compromise for the sake of social cohesion."
+
+**What Amazon is really looking for in Earn Trust:**
+- **Vocal self-criticism**: Can you admit a mistake or a flaw in your own work *before* being asked? Did you name what was wrong specifically, not vaguely?
+- **Candor over comfort**: Did you say a hard truth (to your team, to stakeholders) even when it was uncomfortable?
+- **Reliability / follow-through**: Did you commit to something and deliver? Did you close the loop?
+- **Truth-seeking, not ego-protecting**: When you disagreed, was it because of evidence or because of pride?
+
+**Trigger when:** "Tell me about a time when..." / "Give me an example of..." / "Describe a situation where..." / "Walk me through [your system]" / "Why did you choose [tech]?"
 
 ---
 
@@ -675,13 +689,15 @@ Trigger when: "Tell me about a time when..." / "Give me an example of..." / "Des
 
 | Question Contains... | Leadership Principle | Primary Story |
 |---|---|---|
+| "trust", "honest", "candid", "admit", "mistake", "transparent", "self-critical" | **Earn Trust** ← PRIMARY THIS ROUND | Story F: Dream11 Notification v2 (self-critical about v1, candid about 3 specific flaws) |
+| "disagree", "hard truth", "push back", "rebuild trust", "skeptical" | **Earn Trust** (candor variant) | Story F or Walmart Outbox (candid about retry flaw, committed once aligned) |
 | "quality", "standards", "raise the bar", "unsatisfied" | Insist on Highest Standards | Dream11 Notification v2 |
 | "deadline", "deliver", "obstacle", "setback", "results" | Deliver Results | Walmart Pager Duty |
 | "speed", "quickly", "tight timeline", "risk", "proactive" | Bias for Action | Walmart Pager Duty |
 | "root cause", "complex problem", "dig deep", "investigate" | Dive Deep | Walmart Race Condition |
 | "ownership", "nobody asked", "stepped in", "no one else" | Ownership | Walmart Kafka Outbox |
-| "disagree", "push back", "convinced", "changed mind" | Disagree and Commit | [Frame from Outbox — offered alternative, committed once decided] |
-| "customer", "user impact", "end user" | Customer Obsession | Dream11 Notification (40K clubs, 0 duplicates) |
+| "customer", "user impact", "end user", "user frustration", "member" | Customer Obsession | Story G: Dream11 Notification (40K members, 0 duplicates by design, not by luck) |
+| "learn", "curious", "new technology", "outside scope", "self-taught", "explored" | Learn & Be Curious | Story H: Dream11 Moderation Pipeline (first-time LLM integration, self-initiated) |
 | "ambiguous", "unclear", "no direction", "figure it out" | Are Right, A Lot | Walmart DB Purge |
 
 ---
@@ -714,10 +730,37 @@ E) Ownership / no one else did it?
    BACKUP 1: Walmart DB Purge (caught trend early, wasn't assigned)
 
 F) Disagreeing / pushing back?
-   PRIMARY:  Walmart Kafka Outbox (Story E) — disagreed with retry-first, proposed Outbox,
+   PRIMARY:  Walmart Kafka Outbox — disagreed with retry-first, proposed Outbox,
              committed fully once team aligned, owned implementation end-to-end.
-   BACKUP:   Dream11 Notification v2 — rejected fire-and-forget, proposed durable pipeline,
-             committed to delivery before cricket season despite tighter scope.
+   BACKUP:   Dream11 Notification v2 — rejected fire-and-forget, proposed durable pipeline.
+
+G) ★ EARN TRUST — Vocal self-criticism / candor / admitting a flaw?
+   PRIMARY:  Story F — Dream11 Notification v2 reframed: I was vocally self-critical about
+             a system I had a hand in building (v1). Named 3 specific deficiencies
+             publicly — not vaguely. Built stakeholder trust through evidence, not opinion.
+   BACKUP 1: Walmart Kafka Outbox — spoke a hard truth (retry won't solve dual-write gap).
+             Specific technical candor, not political pushback.
+   BACKUP 2: Walmart DB Purge — proactively raised a trend nobody asked me to look at.
+             Earn trust by catching problems before they become incidents.
+
+H) ★ CUSTOMER OBSESSION — User-first decision making?
+   PRIMARY:  Story G — Dream11 Notification v2: Every design decision traces to a member
+             experience. If JVM crashes at member 39,999 → retry from 0 → 39,999 duplicates.
+             I designed around that failure mode before it happened. 40K-member club,
+             CleverTap 429 at offset 39,000 → resumed, 0 duplicates.
+   BACKUP:   Dream11 Moderation Pipeline — protected members from harmful content.
+             Designed 7 skip conditions to avoid false positives (innocent content flagged)
+             that would hurt creator trust in the platform.
+
+I) ★ LEARN & BE CURIOUS — Self-initiated learning / new technology?
+   PRIMARY:  Story H — Dream11 Moderation Pipeline: First-time LLM integration in the
+             codebase. I researched Gemini Flash, image sports-relevance classification,
+             semaphore patterns in reactive (Vert.x/RxJava) — none of this was standard
+             at Dream11. Self-initiated deep-dive, shipped to production.
+   BACKUP 1: Dream11 Guru Video Pipeline — learned FFmpeg/HLS, Step Functions, epoch-keyed
+             S3 paths, ETag-based SFN idempotency. None of these were existing patterns.
+   BACKUP 2: Walmart DB Purge — explored stored procedures as an alternative primitive
+             to application-level deletion. Changed my mental model of DB responsibility.
 ```
 
 ---
@@ -876,6 +919,99 @@ RESULT:
 
 ---
 
+#### STORY F — ★ EARN TRUST: Dream11 Notification v2 (Vocal Self-Criticism + Candor)
+```
+SITUATION: Dream11 was running Notification v1 — fire-and-forget SQS publish inline
+in club business logic. I had inherited and worked on parts of this system.
+When Clubs feature needed durable notifications for a 40K-member club,
+the existing approach had silent failure modes nobody had formally acknowledged.
+
+TASK: Earn stakeholder trust for a full pipeline redesign in a pre-cricket-season crunch.
+This required being vocally self-critical about a system I had contributed to.
+
+ACTION (EARN TRUST lens):
+  I didn't say "v1 is bad" generically — that would be opinion, not evidence.
+  I mapped 3 specific, demonstrable failure modes:
+  1. No observability: we had no way to confirm whether all 40K members received a notification.
+     If CleverTap silently dropped 5%, we'd never know.
+  2. No durability: JVM crash at member 39,999 → SQS redelivery → retry from member 0
+     → 39,999 duplicate notifications. I built the failure scenario in a test environment
+     and showed the outcome. Not a theory — a reproduced bug.
+  3. No extensibility: CleverTap URL hardcoded across 3-4 services. Every new event type
+     required touching multiple service files — a coupling violation I could name precisely.
+  I presented this to tech lead and product with a failure-mode diagram.
+  I was self-critical: "This is partly a gap in how v1 was designed — I want to fix it right."
+  I proposed a solution with the same honesty: here's what each design decision prevents.
+
+RESULT:
+  Alignment in one meeting — trust earned by evidence, not advocacy.
+  Shipped before cricket season. Zero duplicate notifications since launch.
+  3 CleverTap outages handled via checkpoint resume — system behaved exactly as designed.
+  Tech lead used my failure-mode analysis framework for the next two system redesigns.
+```
+
+#### STORY G — ★ CUSTOMER OBSESSION: Dream11 Notification v2 (Built for the Member, Not for Simplicity)
+```
+SITUATION: Same notification system redesign. The easy path was fire-and-forget —
+fast to build, functionally "good enough" for small clubs.
+But a 40K-member club is not a small club. At that scale, reliability IS the product.
+
+TASK: Design a notification pipeline that protects the member experience even under
+infrastructure failures — not just under the happy path.
+
+ACTION (CUSTOMER OBSESSION lens):
+  I worked backward from failure modes that would hit real members:
+  - JVM crash at member 39,000 → retry from 0 → 39,000 people get duplicate push notification.
+    That's not a backend problem. That's a user trust problem.
+    Fix: last_successful_offset checkpoint. Retry resumes from exactly where it left off.
+  - CleverTap 429 at member 38,000 → silent drop in v1.
+    Fix: RETRY_ELIGIBLE status + retry cron. No member left unnotified because of a rate limit.
+  - Two cron instances process same PENDING event → duplicate SQS messages → duplicates.
+    Fix: Consumer checks DB status before paginating on isRetry=true.
+  Every design decision traces to a specific member-visible failure, not to engineering elegance.
+
+RESULT:
+  40K-member club: CleverTap 429 at offset 39,000 → resumed at 39,000 → 0 duplicates.
+  3 CleverTap outages since launch — all recovered automatically.
+  Members never saw a service disruption; they just received their notifications slightly late.
+  The system treated user experience as a correctness constraint, not a best-effort target.
+```
+
+#### STORY H — ★ LEARN & BE CURIOUS: Dream11 Content Moderation Pipeline (First LLM Integration)
+```
+SITUATION: Dream11 needed content moderation for club posts and comments.
+GetStream provided a basic text verdict. But image sports-relevance — whether an image
+actually shows cricket content vs random photos — was not covered by any existing tool.
+No LLM had been integrated into the Dream11 backend before this.
+
+TASK: Design and implement an in-house LLM-based moderation stage.
+This required learning a technology (Gemini Flash), a new concurrency pattern
+(semaphore in Vert.x reactive chains), and a new problem domain (prompt engineering).
+
+ACTION (LEARN & BE CURIOUS lens):
+  I didn't wait for someone to tell me how to do it — I researched independently:
+  1. Evaluated Gemini Flash vs GPT-4V: latency vs cost vs accuracy for image classification.
+     Chose Gemini Flash: <2s median, lowest per-call cost, sports-context prompting accurate.
+  2. Learned Semaphore in RxJava/Vert.x reactive chains — not documented anywhere at Dream11.
+     Built a configurable, fair (FIFO) semaphore to cap concurrent LLM calls at 3.
+     Why 3? Empirically tested: beyond 3, latency degrades, 429s spike. Under 3, throughput
+     is underutilized. This was learned through experimentation, not from a manual.
+  3. Designed 7 skip conditions to avoid unnecessary LLM calls — draft IDs, non-numeric IDs,
+     already-terminal entities. Mapped every skip to a concrete message type that would
+     otherwise waste an API call.
+  4. Built exponential backoff: 1s base for TRANSIENT, 30s base for 429 RATE_LIMITED —
+     different errors deserve different retry strategies. Learned this through incident analysis.
+
+RESULT:
+  First LLM integration in Dream11's clubs backend. <2s moderation latency.
+  Zero cascade failures from rate limiting — semaphore absorbs spikes cleanly.
+  Binary APPROVED/REJECTED verdict with full audit trail.
+  The semaphore pattern I designed was adopted for another async pipeline.
+  I documented the prompt engineering approach — became the reference for the team.
+```
+
+---
+
 ### HM PHASE 5 — FOLLOW-UP GUARDRAILS
 
 "What would you do differently?"
@@ -908,6 +1044,185 @@ Framework (state this structure out loud):
 4. Investigation — what data/signals would I gather?
 5. Decision criteria — what would change my approach?
 6. Escalation — who needs to be looped in and when?
+
+---
+
+### HM PHASE 7 — HLD & RESUME GRILLING PREP
+
+**This phase is unique to the HM+HLD combined round. After LP questions, the interviewer will pivot to technical grilling on your resume systems and HLD concepts. Be ready for BOTH simultaneously.**
+
+---
+
+#### 🗂️ RESUME SYSTEM QUICK-FIRE (Interviewer asks "Walk me through X")
+
+**Dream11 Notification System v2**
+> *"Why DB-backed cron polling instead of direct SQS publish from the API?"*
+> "Classic Outbox pattern — decouples the business transaction from event publishing. If SQS publish fails during the API call, the event is permanently lost. Writing to `notification_events` first guarantees durability — the publisher cron always picks it up. The DB is the source of truth; SQS is just the delivery vehicle."
+
+> *"What is `last_successful_offset` doing?"*
+> "It's a resumption checkpoint for mid-batch failures. If the consumer fails while paginating through 40K members at page 390 (offset 39,000), the next retry starts from offset 39,000 — not from 0. Without it, every retry would re-deliver notifications to members 0–38,999. The checkpoint is what makes retries safe for users."
+
+> *"Why use OFFSET pagination here when you usually prefer cursor?"*
+> "Because OFFSET IS the checkpoint value. This is a bounded operation — paginating through all members of one club for one notification event. The OFFSET gives us a deterministic restart position. Cursor pagination is for unbounded, open-ended reads across many users — not for a single recoverable operation with a known size."
+
+---
+
+**Dream11 Guru Video Pipeline**
+> *"Why DynamoDB instead of MySQL for Guru Teams?"*
+> "The access pattern is always: get all teams for a round by guruId/teamId — no joins needed. DynamoDB's composite key (PK=ROUND#{roundId}, SK=GURU#{guruId}#TEAM#{teamId}) covers every read pattern. At peak, the listing endpoint hits 2.5M RPM — DynamoDB scales horizontally without connection pool exhaustion, which MySQL would hit at that throughput."
+
+> *"How did you prevent duplicate Step Function executions?"*
+> "ETag-based idempotency. We SHA1-hash the S3 ETag + roundId + guruId + teamId → use that as the SFN execution name. Before starting, we call DescribeExecution — RUNNING or SUCCEEDED means no-op. FAILED means retry with a suffix (-r1, -r2). The ETag changes on every re-upload, so a genuine re-upload correctly triggers a new execution."
+
+> *"Why epoch in the S3 path?"*
+> "Zero-downtime CDN cache busting without explicit invalidation. Every re-upload generates a new epoch → new S3 key → new CloudFront URL. Old URL naturally expires via TTL. Without epoch, re-upload with the same path would require an explicit CloudFront invalidation which takes minutes — during which viewers see stale video."
+
+---
+
+**Dream11 Content Moderation Pipeline**
+> *"Why semaphore for rate-limiting LLM calls instead of a queue?"*
+> "The LLM call is synchronous within a reactive chain. Introducing a queue means a second consumer hop, added latency, and more infrastructure. A semaphore gives bounded concurrency (3 max) directly in-process — simpler, lower latency, and limit is configurable without infra changes. We empirically found 3 concurrent calls as the sweet spot."
+
+> *"What are the 7 skip conditions?"*
+> "Draft IDs (draft-sync-, draft-comment- prefixes), non-numeric entity IDs, entity ID ≤ 0, unsupported entity type, entity not found in DB, entity already in terminal state (PUBLISHED or REJECTED). These prevent wasted LLM API calls on malformed events or content that's already been resolved — each condition came from a real production edge case."
+
+---
+
+**Walmart Kafka Outbox Pattern**
+> *"Why is retry logic insufficient for the dual-write problem?"*
+> "Retry assumes the message was produced but not acknowledged. It doesn't solve the case where the JVM crashes between the DB write and the Kafka produce call — the event is permanently lost, not delayed. A retry on a lost event retries zero times. The Outbox pattern makes DB write and event recording atomic — they're in the same transaction. The relay component then publishes, and if it fails, it retries from the durable outbox."
+
+---
+
+#### 📡 HLD TECH CONCEPT CHALLENGE CARDS
+
+**Redis — Eviction Policies**
+> *"What happens when Redis runs out of memory?"*
+> "Redis applies the configured eviction policy. Most common: `allkeys-lru` — removes the least recently used key across all keys. `volatile-lru` — same but only for keys with a TTL set, preserving permanent keys. `allkeys-lfu` (Redis 4+) — least frequently used, better for access-skewed workloads where some keys are always hot. For a session cache I'd use `volatile-lru`; for a general cache `allkeys-lru`."
+
+**Redis — RDB vs AOF Persistence**
+> *"How does Redis handle data durability?"*
+> "Two mechanisms: RDB (snapshotting) takes periodic point-in-time snapshots to disk — fast restart, but can lose up to 60s of writes on crash. AOF (Append-Only File) logs every write command — near-zero data loss with `fsync always`, but slower restart and larger file. Production typically uses both: AOF for durability guarantees, RDB for fast recovery baseline. For a cache-only Redis (session data), I might disable both — cache misses are acceptable."
+
+**Redis — Cluster vs Sentinel**
+> *"How do you scale Redis?"*
+> "Sentinel: high-availability for a single-master setup. Monitors the master, promotes a replica on failure — vertical HA, not horizontal scale. Cluster: horizontal sharding across multiple masters via 16,384 hash slots. Each key hashes to a slot, each slot is owned by a master. Use Sentinel for datasets under ~50GB; Cluster when you need to shard data across machines. Our use case for caching balance reads would be Sentinel — dataset is small, we need fast failover, not sharding."
+
+**Redis — Pub/Sub vs Kafka**
+> *"When would you use Redis pub/sub over Kafka?"*
+> "Redis pub/sub: at-most-once delivery, no persistence — if a subscriber is down, the message is lost. Good for transient, real-time events where missing one is acceptable (live presence updates, real-time counters). Kafka: durable, replayable, consumer groups — at-least-once delivery. Good for audit trails, event sourcing, retry-tolerant async processing, and any case where message loss is unacceptable. For a financial transaction feed — Kafka. For 'user is currently typing' — Redis pub/sub."
+
+**Kafka — Consumer Groups & Partitions**
+> *"How does Kafka scale consumers?"*
+> "Consumer groups — multiple consumers in a group share partition consumption. Each partition is consumed by exactly one consumer in the group at a time. So with 10 partitions, you can have up to 10 active consumers in a group. Beyond that, extra consumers sit idle. To scale throughput: increase partitions (can't reduce later without rebalancing), add consumers up to that partition count. Rebalancing happens when consumers join/leave the group."
+
+**Kafka — At-Least-Once vs Exactly-Once**
+> *"What's at-least-once delivery and how do you handle duplicates?"*
+> "At-least-once: consumer commits the offset after processing. If the consumer crashes before committing, the message is reprocessed on restart. Idempotent processing is the safety net — use a unique constraint or a processed-ID check to detect and skip duplicates. Exactly-once: uses Kafka transactions — the producer is idempotent and the offset commit + produce are atomic. More overhead; needed for financial systems where duplicate processing causes real money movement. For most event systems, at-least-once + idempotent consumer is the correct tradeoff."
+
+**Kafka — Lag and Backpressure**
+> *"What happens if your Kafka consumer falls behind?"*
+> "Consumer lag = (latest offset) - (committed offset). Causes: slow downstream (DB writes, external API), insufficient consumer threads, partition hotspot. Monitoring: track lag per consumer group via JMX or tools like Burrow. Mitigation: increase partitions + consumers to match, batch DB writes, async processing for non-critical side effects, add backpressure at the upstream producer. The Outbox relay I built at Walmart had a monitoring alert on outbox table row count — if it grew beyond a threshold, it triggered a lag alert."
+
+**SQS — DLQ and Retry Strategy**
+> *"How does SQS dead-letter queue work?"*
+> "SQS delivers a message up to `maxReceiveCount` times (configurable). If the consumer fails and doesn't delete the message within the visibility timeout, SQS redelivers it. After `maxReceiveCount` failures, the message is moved to the DLQ — a separate queue for manual inspection. The DLQ catches infrastructure failures (consumer crashes, malformed messages) that retries can't fix. In our notification system, the DLQ catches non-retryable failures — malformed JSON, consumer OOM — while the DB-driven retry handles business-level failures (CleverTap 429)."
+
+**DynamoDB — GSI vs LSI**
+> *"When do you use a GSI vs LSI?"*
+> "LSI: alternate sort key on the same partition key. 10GB limit per partition key value. Used when you need to query the same entity differently — e.g., get all posts in a club sorted by likes instead of time. GSI: completely independent PK+SK — your own partition key across the whole table. No storage limit. Used for different access patterns that don't share the base table's partition key — e.g., find all videos with status=LIVE regardless of roundId. In the Guru pipeline, we used a GSI on videoStatus to find all LIVE videos for the listing page."
+
+---
+
+---
+
+# ===============================================================
+# ROUND 4 — BAR RAISER PROTOCOL (PROBLEM-SOLVING ROUND)
+# ===============================================================
+
+## 🏆 BAR RAISER — WHAT TO EXPECT
+
+The Bar Raiser is a senior Amazonian (not on the hiring team) whose sole job is to ensure every hire is better than 50% of current employees at that level. They probe deeply, follow up aggressively, and are comfortable with silence.
+
+**Primary LPs probed:**
+1. **Learn & Be Curious** — *"What did you teach yourself? What changed your thinking?"*
+2. **Customer Obsession** — *"How did the user drive your technical decisions?"*
+
+**Bar Raiser behaviour to expect:**
+- They will ask "why" 3-4 times in a row — don't get defensive, they're measuring depth
+- They will ask about failures and what you learned — don't hide failure, lean into it
+- They prefer specific, data-backed examples over frameworks
+- They will probe the alternative you didn't take — be ready to defend your choice
+- Silence is OK — pause, think, answer. Don't fill silence with filler words.
+
+---
+
+## 📋 BAR RAISER — LP DETECTION & STORY TRIGGER
+
+### PHASE 1 — LP Triggers
+
+| Question Contains... | LP | Story |
+|---|---|---|
+| "learn", "new technology", "outside comfort zone", "explored", "curious", "taught yourself" | **Learn & Be Curious** | Story H: Moderation Pipeline LLM integration |
+| "changed your approach", "different perspective", "new way", "challenged your assumption" | **Learn & Be Curious** (growth variant) | Walmart DB Purge (changed mental model of DB responsibility) |
+| "customer", "user", "member", "end-to-end experience", "user frustration" | **Customer Obsession** | Story G: Notification v2 (40K members, failure-mode-driven design) |
+| "trade-off", "user needs vs technical complexity", "business impact" | **Customer Obsession** (trade-off variant) | Dream11 Moderation (7 skip conditions = protecting creators from false positives) |
+| "mistake", "failure", "what you'd do differently", "what you learned" | **Learn & Be Curious** (growth from failure) | Any story — append "what I learned" + "what I changed permanently" |
+
+---
+
+### PHASE 2 — BAR RAISER STAR STORY TEMPLATES
+
+**When answering: Always close with "what permanently changed" — this is what Learn & Be Curious requires**
+
+```
+BAR RAISER TIMING: Total 4-5 min. Spend extra time on Action.
+The Bar Raiser will interrupt with follow-ups DURING your action section — that's fine.
+Pause after each action step and let them probe before continuing.
+
+[SITUATION — 30 sec]
+[TASK — 15 sec — YOUR specific role]
+[ACTION — 3 min]
+  Step 1: What I knew vs what I didn't know at the start
+  Step 2: How I filled the knowledge gap (research, experiment, prototype)
+  Step 3: Key decision point — what I chose and what I explicitly rejected
+  Step 4: What surprised me / what didn't work
+[RESULT — 30 sec — with metrics]
+[LEARN CLOSE — 20 sec — "What permanently changed for me was..."] ← CRITICAL for Bar Raiser
+```
+
+---
+
+### PHASE 3 — BAR RAISER DEEP-FOLLOW-UP PREP
+
+The Bar Raiser will NOT accept surface answers. For each story, prepare these probes:
+
+**Story H (Moderation / Learn & Be Curious):**
+- "Why Gemini Flash specifically? Did you evaluate other models?" → "Yes — evaluated GPT-4V (higher cost, slightly better accuracy), Claude (slower API), Gemini Flash (lowest latency <2s, cheapest per call, acceptable accuracy for sports-relevance binary classification). The use case didn't require 98% accuracy — it required <2s and cost control. Gemini won on those metrics."
+- "What didn't work the first time?" → "My first semaphore implementation wasn't fair — high-burst events could starve low-burst ones. I switched to a FIFO semaphore after observing starvation in load tests. That was a learning I didn't anticipate from the docs."
+- "What would you do differently?" → "I'd add a circuit breaker around the LLM call. If Gemini is down, we currently fall back to DLQ. A circuit breaker would detect sustained failures and skip LLM processing entirely, flagging content for human review instead of queuing endlessly."
+
+**Story G (Notification / Customer Obsession):**
+- "How did you know 40K members would be a problem?" → "I didn't — v1 was never stress-tested at that scale. But I reasoned forward: if a popular contest launches and 40K members need notifications, what are the failure modes? I didn't wait for a production incident to find them. I built the failure scenario in a test environment."
+- "Why was durability more important than latency here?" → "Because the notification is a 'club event happened' signal — a member who gets it 30 seconds late has a worse experience than a member who gets it twice. Duplicates erode trust in the product; late delivery is recoverable. The cron cycle introduced up to 30s of latency, which we accepted as the cost of durability."
+
+---
+
+### PHASE 4 — BAR RAISER FAILURE QUESTION FRAMEWORK
+
+"Tell me about a time you failed" / "What's your biggest professional mistake?"
+
+**Rule: Never say your failure was small. Choose a real one. Lean into it.**
+
+Verbal framework (say this structure out loud):
+1. "The mistake I want to share is [X] — it was meaningful because [stakes]."
+2. "What I did wrong: [specific actions, not vague 'communication issues']"
+3. "The impact: [quantify — who was affected, how]"
+4. "What I did to fix it: [specific actions]"
+5. "What permanently changed: [behavior, process, mental model — NOT just 'I learned to communicate better']"
+
+Example framing (Walmart Pager Duty — turned into failure story):
+> "The failure was the gap between finding the bug and having the protection in place. I made a calculated risk — manually correct the DB to unblock the warehouse — which was right. But the root cause investigation took a weekend. During that window, the system was unprotected. If DC #2 had the same bug before I closed it, we'd have had a second incident. The lesson: any live system fix needs a monitoring alert as the FIRST action, not just the manual correction. I now treat alerting as a prerequisite to declaring a fix complete, not an afterthought."
 
 ---
 
@@ -965,10 +1280,28 @@ Case C — Gentle Push-back (Suggestion violates correctness):
   helps me avoid reworking mid-way. [Ask 3-4 questions]. Great.
   Let me start with the entities, then relationships, patterns — and we can go into persistence and API design if time allows."
 
-## HM — Opening 10 seconds
+## HM + HLD Combined Round — Opening 10 seconds (LP question)
 > "Great question. Let me think of the best example from my experience.
   [Pause 3-4 seconds — signals thoughtfulness even if you know the story.]
   I have a strong example from my time at [company]. Here's the situation..."
+
+## HM + HLD Combined Round — Pivot when they shift to technical (say this)
+> "Happy to walk you through that. Should I start with the architecture overview first
+  and then go into implementation details, or would you rather I start with a specific
+  component — like the data model or the reliability mechanism?"
+  [Why: signals you're organised, gives the interviewer control, and buys you 5 seconds
+   to recall the right details from the system.]
+
+## Bar Raiser — Opening (LP question)
+> "Great question. I want to give you a real example, not a polished one.
+  [Pause 3-4 seconds.] There's a situation from [company] that comes to mind immediately
+  because it genuinely changed how I think. Here's what happened..."
+  [Why: "real, not polished" signals self-awareness — Bar Raiser scores this highly.]
+
+## Bar Raiser — When they ask "what would you do differently?"
+> "Honestly, [specific thing]. I wouldn't do the same again because [specific reason].
+  What I've permanently changed since then is [concrete behavior change]."
+  [Why: the Bar Raiser is testing whether you actually learned — vague answers fail this test.]
 
 ---
 
